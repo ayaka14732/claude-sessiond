@@ -28,6 +28,8 @@ curl -s $B/prompts
 
 ## 文档
 
+在线文档：<https://ayaka14732.github.io/claude-sessiond/>
+
 - [会话与消息](docs/guide/sessions.md)：会话的状态、休眠与归档、消息的状态、权限确认与提问、文件回滚。
 - [部署与账号](docs/guide/deployment.md)：登录凭据、多个账号与额度用完时的自动切换、访问控制。
 - [参考](docs/reference.md)：命令行参数、HTTP API、事件格式与 webhook。

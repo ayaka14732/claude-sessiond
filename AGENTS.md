@@ -13,7 +13,7 @@ Markdown 段内不折行。
 - `README.md` 是概述，文档站首页原样包含它；详细内容写在 `docs/` 中，README 只链接过去。
 - `docs/` 是中文站，用 Sphinx 与 MyST 构建。`docs/en/` 预留给以后的英文站：届时与 `docs/` 逐文件对应，并有自己的 `conf.py`，导入 `docs/conf.py` 后只修改 `language` 与 `exclude_patterns`；`docs/conf.py` 已把 `en` 排除在中文站之外。
 - 新增页面时在 `docs/index.md` 的相应 toctree 中登记。
-- 文档应以下面的命令构建通过，不允许任何警告：
+- 推送到 `main` 后，`.github/workflows/docs.yml` 以同样的命令构建文档站并部署到 GitHub Pages。文档应以下面的命令构建通过，不允许任何警告：
 
 ```sh
 uv run --no-project --with-requirements docs/requirements.txt python -m sphinx -n -W --keep-going -b html docs docs/_build
