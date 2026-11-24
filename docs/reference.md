@@ -1,6 +1,6 @@
 # 参考
 
-运行中的守护进程在 `/docs` 提供交互式 API 文档，在 `/openapi.json` 提供机器可读的接口描述。本页说明其中没有体现的语义。
+运行中的守护进程在 `/openapi.json` 提供机器可读的接口描述，包括各端点的请求与响应字段。本页说明其中没有体现的语义。
 
 ## 命令行参数
 
@@ -12,7 +12,7 @@
 | `--idle-timeout` | `1800` | 会话空闲多少秒后进入休眠 |
 | `--prompt-timeout` | `3600` | 提示最多等待多少秒，超时按拒绝处理；`0` 表示一直等待 |
 | `--webhook`、`--webhook-token` | `$SESSIOND_WEBHOOK`、`$SESSIOND_WEBHOOK_TOKEN` | 通知的目标地址与随通知发送的 bearer token |
-| `--state` | `~/.local/state/claude-sessiond/sessions.json` | 状态文件：托管的会话、会话选项、事件序号与归档状态；账号保存在同一目录的 `accounts.json` 中 |
+| `--state` | `~/.local/state/claude-sessiond/sessions.json` | 状态文件：托管的会话、会话选项、事件序号与归档状态；账号保存在同一目录的 `accounts.json` 中，经 API 登录的账号的凭据保存在同一目录的 `logins/<账号名>/` 中 |
 | `--cli-path` | SDK 自带的 `claude` | 改用指定的 Claude Code 可执行文件 |
 | `--keep-env` | 无 | 额外保留并传给会话的 `CLAUDE_*` 环境变量，可重复指定 |
 
@@ -40,10 +40,14 @@
 | `GET /prompts` | 所有会话中待回答的提示 |
 | `POST /sessions/{id}/prompts/{prompt_id}` | 回答提示，格式见[权限确认与提问](guide/sessions.md#权限确认与提问) |
 | `GET /transcripts` | 本机的会话记录（`?cwd=` 筛选），标明是否已托管、是否已归档、是否正被某个进程打开 |
-| `GET /accounts` | 账号及其状态：`kind`（`inherited`、`oauth_token` 或 `api_key`）、`env` 中的变量名、`available`、`limited`（`rate_limit` 或 `billing_error`）、`limited_until`、使用它的会话数 |
+| `GET /accounts` | 账号及其状态：`kind`（`inherited`、`login`、`oauth_token` 或 `api_key`）、`env` 中的变量名、`available`、`limited`（`rate_limit` 或 `billing_error`）、`limited_until`、使用它的会话数 |
 | `POST /accounts` | 登记账号：`name`，`oauth_token` 或 `api_key`，`env` |
-| `DELETE /accounts/{name}` | 删除账号（`default` 除外）；使用它的会话下次启动时改用第一个可用的账号 |
+| `DELETE /accounts/{name}` | 删除账号（`default` 除外）及其登录凭据；使用它的会话下次启动时改用第一个可用的账号 |
 | `POST /accounts/{name}/reset` | 清除账号的不可用标记 |
+| `POST /accounts/{name}/login` | 开始在浏览器中登录该账号，取消它此前未完成的登录；返回授权地址 `url` 与截止时间 `expires`。`default` 登录守护进程自身的凭据，其他账号在登录成功后登记或更新为 `login` 账号；登录的账号名只能由字母、数字、`.`、`_` 与 `-` 组成，且不以 `.` 开头 |
+| `GET /accounts/{name}/login` | 该账号最近一次登录：`status`（`pending`、`done`、`failed` 或 `cancelled`）、`url`、`expires`、`profile`（登录的账号信息，例如 `email`、`subscriptionType`）、`error` |
+| `GET /accounts/{name}/login/open` | 302 重定向到进行中的登录的授权地址，供浏览器直接打开；需要 token 时用查询参数 `?token=` |
+| `DELETE /accounts/{name}/login` | 取消进行中的登录 |
 
 新建会话时，除 `cwd`（新建时必填）、`resume`、`fork`、`force`、`prompt`、`wait`、`timeout` 外，以下字段决定 `claude` 进程的启动方式，并保存在状态文件中：`name`、`model`、`permission_mode`、`effort`、`append_system_prompt`（追加到 Claude Code 系统提示词之后）、`allowed_tools`、`disallowed_tools`、`add_dirs`、`max_budget_usd`、`partial_messages`（输出逐 token 的 `StreamEvent`）、`allow_bypass`（缺省为真）、`checkpointing`（缺省为真）、`account`（缺省为第一个可用的账号）。
 

@@ -31,14 +31,24 @@ CLI 在某个回合实际吸收一条用户消息时，以同一个 `uuid` 回�
 
 ## 直接发送的控制请求
 
-Python SDK 的 `rewind_files()` 丢弃 CLI 的响应，不支持 dry run，SDK 也没有包装 `cancel_async_message`。守护进程通过 SDK 的私有方法 `_query._send_control_request` 直接发送这两个控制请求，格式与 TypeScript SDK 相同：
+Python SDK 的 `rewind_files()` 丢弃 CLI 的响应，不支持 dry run，SDK 也没有包装 `cancel_async_message` 与登录。守护进程通过 SDK 的私有方法 `_query._send_control_request` 直接发送这些控制请求，格式与 TypeScript SDK 相同：
 
 | 请求 | 响应中使用的字段 |
 | --- | --- |
 | `{"subtype": "cancel_async_message", "message_uuid": …}` | `cancelled` |
 | `{"subtype": "rewind_files", "user_message_id": …, "dry_run": …}` | `canRewind`、`error`、`filesChanged`、`insertions`、`deletions` |
+| `{"subtype": "claude_authenticate", "loginWithClaudeAi": true}` | `automaticUrl` |
+| `{"subtype": "claude_oauth_wait_for_completion"}` | `account` |
 
-升级 SDK 之后，应首先确认这个私有方法仍然存在，并重新验证撤回与回滚。
+`requirements.txt` 把 SDK 固定在已验证的版本上。升级 SDK 之后，应首先确认 `_query._send_control_request` 仍然存在，并重新验证撤回、回滚与登录。
+
+## 登录
+
+登录由一个不运行会话的专用 `claude` 进程完成，两个凭据变量设为空字符串，使 CLI 使用并写入自己的凭据存储。`claude_authenticate` 返回的 `automaticUrl` 重定向到该进程在本机监听的端口，`claude_oauth_wait_for_completion` 在 CLI 收到重定向、换得并保存凭据之后响应。`claude_authenticate` 同时返回的 `manualUrl` 以一个显示 code 的页面结束，需要把 code 经 `claude_oauth_callback` 交回 CLI；守护进程不采用这种方式。监听端口收到不是由授权页面重定向而来的请求时，这次登录以 `No authorization code received` 失败。
+
+CLI 的凭据存储目录（Linux 上的 `.credentials.json`；macOS 钥匙串条目的名称也由它派生）在设置了 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 时取该变量，否则取配置目录。守护进程据此为 `default` 以外的每个账号单独设置凭据存储目录，配置目录保持共用：若为每个账号单独设置 `CLAUDE_CONFIG_DIR`，会话记录与用户设置也会随之分开，切换账号后会话无法恢复。CLI 把这个变量传给自己启动的子进程（例如 teammate）。
+
+登录还把账号的身份（`oauthAccount`）写入配置目录的 `.claude.json`。为了不让其他账号的登录覆盖 `default` 的身份，这些登录的进程使用临时的 `CLAUDE_CONFIG_DIR`，登录结束后删除。`oauthAccount` 与会话实际使用的凭据属于不同账号时，会话照常以凭据所属的账号运行，CLI 也不改写 `oauthAccount`；`claude auth status` 显示的身份取自 `oauthAccount`，与凭据无关，因此要确认某份凭据属于哪个账号，应以它的 access token 查询 `/api/oauth/profile`。
 
 ## 账号切换
 
@@ -50,7 +60,7 @@ Python SDK 的 `rewind_files()` 丢弃 CLI 的响应，不支持 dry run，SDK �
 | API key 的速率限制（HTTP 429） | 没有 `rate_limit_event`；`error` 为 `rate_limit` |
 | API 余额不足（HTTP 400） | `error` 为 `billing_error` |
 
-CLI 在订阅额度用完时还带有 `apiError: "usage_limit_reached"`，但 Python SDK 的 `AssistantMessage` 不保留这个字段，因此守护进程无法区分额度用完与短暂的速率限制，两者都会切换。只有结果 `is_error` 为真时才切换并继续；若只有子智能体遇到限制而回合本身成功，账号仍被标记为不可用，但不发送继续的消息。
+CLI 在订阅额度用完时还带有 `apiError: "usage_limit_reached"`，但 Python SDK 的 `AssistantMessage` 不保留这个字段，因此守护进程无法区分额度用完与短暂的速率限制，两者都会切换。只有结果 `is_error` 为真时才切换并继续；若只有子智能体遇到限制而回合本身成功，账号仍被标记为不可用，但不发送继续的消息；子智能体失败的通知随即开启的回合在同一个账号下同样失败，由那个回合触发切换。继续的消息明确说明新账号没有受限：只说会话换了账号时，主会话会看到上一条错误中的重置时间，打算等到那时再恢复停下的子智能体。
 
 凭据通过 `ClaudeAgentOptions.env` 传给进程。SDK 把它覆盖在继承的环境之上，无法删除继承的变量，因此守护进程把另一个凭据变量设为空字符串：实测 CLI 把空字符串视为未设置。`ANTHROPIC_API_KEY` 优先于已有的登录凭据；两个变量同时设置时，`CLAUDE_CODE_OAUTH_TOKEN` 优先。
 
@@ -68,21 +78,3 @@ CLI 在订阅额度用完时还带有 `apiError: "usage_limit_reached"`，但 Py
 | 上一回合的结果、累计费用 | 无 | 归档（结果）、守护进程重启 |
 
 休眠时保留已发消息的状态，是为了在进程异常退出后仍能查到哪些消息被 `dropped`。守护进程重启时，进行中的回合中止，会话以休眠状态载入；会话记录不受影响。
-
-## 验证
-
-以 Claude Agent SDK 0.2.188（自带 Claude Code 2.1.331）与 Haiku 5.5，通过 HTTP 驱动真实会话，以下各项均已通过。测试环境的用户设置中 `defaultMode` 为 `bypassPermissions`，因此涉及权限确认的用例显式传入 `permission_mode: "default"`。
-
-- **对话**：新建会话时附带第一条消息，`wait` 返回结果，后续消息保留上下文；`/compact` 正常压缩上下文（出现 `compact_boundary`）；会话记录中经守护进程发出的消息是普通的用户记录（没有 `isMeta` 与 `origin`），系统提示词为 Claude Code 的提示词。
-- **回合中途的消息**：Bash 运行 12 秒期间发出的消息被同一回合执行，`user_message_uuids` 包含两条消息。同样期间发出的两条消息先处于 `queued`；撤回其中一条后，它没有交给模型，重复撤回返回 409；另一条在工具调用结束时被吸收，`checkpoint` 为假。
-- **中断**：中断正在执行 90 秒命令的回合，0.5 秒内结束，`terminal_reason` 为 `aborted_tools` 或 `aborted_streaming`。
-- **权限确认与提问**：Write 的权限确认出现在 `/prompts`，状态为 `waiting`，批准后文件写入；被拒绝的 `rm` 没有执行，Claude 收到了拒绝理由。AskUserQuestion 以 `question` 提示出现，回答后 Claude 使用了所选的选项，`bypassPermissions` 下同样挂起。`PATCH` 切换到 `bypassPermissions` 立即生效。
-- **提示超时**：`--prompt-timeout 8` 时，Write 的权限确认在 8 秒后按拒绝处理，`reason` 为 `timeout`，文件没有写入；Claude 没有重试，回合结束，状态回到 `idle`。下一回合经 API 批准，`reason` 为 `answered`，文件写入。
-- **Webhook**：按顺序收到 `prompt`（会话状态为 `waiting`）、`prompt_resolved`、`result`，均附带 bearer token；目标地址格式错误时，发送失败被记录到标准错误输出，后续通知照常处理。
-- **休眠与恢复**：`/stop` 与空闲超时后进程退出，下一条消息自动恢复，上下文保留。有 35 个事件的会话休眠后，`/log?after=0` 只剩 `seq` 为 36 的 `dormant` 事件，`/messages` 的三条记录保留，`/history` 完整。守护进程重启后 `seq` 仍为 36，恢复后的新事件从 37 开始。
-- **归档**：归档的会话不出现在 `GET /sessions` 的缺省结果中，`?include_archived=true` 时列出，`/log` 只剩 `archived` 事件，`/messages` 为空，`/transcripts` 标为已归档；对它再次 `resume` 返回 409；直接发送消息后自动取消归档，上下文保留；`/unarchive` 后会话仍为 `dormant`。归档状态与 `seq` 写入了状态文件。
-- **托管已有会话**：`fork` 得到带有原上下文的新会话；`DELETE ?purge=true` 删除会话记录；第二个守护进程 `resume` 已被第一个打开的会话时返回 409。
-- **文件回滚**：Write 新建 a.txt（v1）、下一回合 Edit 为 v2 之后，dry run 列出 a.txt 且不改动文件；回滚到第二条消息恢复为 v1；回滚到回合中途吸收的消息返回 409；会话休眠后回滚到第一条消息，守护进程自动恢复进程并删除 a.txt，此后对话照常继续。
-- **事件流**：SSE 收到各类事件，`Last-Event-ID` 续传只补发之后的事件；`/log` 长轮询在没有新事件时按时返回。
-- **账号切换**：在两个本地模拟 API 上登记账号：一个以 OAuth token 访问、返回订阅的 5 小时额度用完，一个以 API key 访问、返回余额不足。在前者下新建会话并以 `wait` 发送第一条消息，会话切换到 `default`，`wait` 返回继续之后那个回合的正确回答；该账号标为 `rate_limit`，恢复时间约为 1 小时后（即模拟的重置时间），`account_switched` 事件与通知的 `reason` 为 `rate_limit`。后者标为 `billing_error`，没有恢复时间，`reset` 后恢复可用。把休眠会话的账号改回不可用的账号后再发消息，会话以 `unavailable` 为由改用 `default`，上下文保留。其他账号都不可用时，原回合的错误结果原样返回，并发出 `accounts_exhausted`。未知账号返回 400，`default` 不能删除，`accounts.json` 的权限为 600，`GET /accounts` 不包含凭据。模拟 API 对每个请求都返回错误，因此回合进行到中途才遇到限制的情形没有单独验证，其处理与回合开始时相同。
-- **环境与认证**：从 Claude Code 会话内启动时，`claude` 子进程的环境中没有 `CLAUDECODE`、`CLAUDE_CODE_SESSION_ID` 等变量，`CLAUDE_CODE_ENTRYPOINT` 为 `sdk-py`，`CLAUDE_CODE_OAUTH_TOKEN` 与 `CLAUDE_CONFIG_DIR` 原样传入。不带 token 或 token 错误（包括含非 ASCII 字符的 token）返回 401，Host 头不在白名单中时返回 403。

@@ -1,17 +1,19 @@
 # claude-sessiond
 
-claude-sessiond 是一个常驻的 HTTP 守护进程，通过 Web API 托管 Claude Code 会话：新建会话、以用户本人的身份发送消息、跟随实时输出、中断回合，以及回答权限确认与 AskUserQuestion。它基于 Claude Agent SDK（Python），每个会话对应一个常驻的 `claude` 进程，不模拟终端。
+claude-sessiond 是一个常驻的 HTTP 守护进程，通过 Web API 托管 Claude Code 会话：新建会话、以用户本人的身份发送消息、跟随实时输出、中断回合，以及回答权限确认与 AskUserQuestion。它基于 Claude Agent SDK（Python），每个会话对应一个常驻的 `claude` 进程。
 
-经由 claude-sessiond 发送的消息是普通的用户消息，与在 CLI 中输入的消息相同：回合进行中发出的消息由当前回合吸收并执行，斜杠命令照常生效。会话使用 Claude Code 自身的系统提示词，加载用户、项目与本地三层设置（CLAUDE.md、skills、hooks、MCP 与权限规则），会话记录照常写入 `~/.claude/projects`，随时可以用 `claude --resume <id>` 在 CLI 中继续。这一点与 channel 不同：channel 把外部消息注入一个已打开的会话，回合进行中到达的内容被视为不可信的外部数据，也无法新建会话或回答权限确认。
+经由 claude-sessiond 发送的消息是普通的用户消息，与在 CLI 中输入的消息相同：回合进行中发出的消息由当前回合吸收并执行，斜杠命令照常生效。会话使用 Claude Code 自身的系统提示词，加载用户、项目与本地三层设置（CLAUDE.md、skills、hooks、MCP 与权限规则），会话记录照常写入 `~/.claude/projects`，随时可以用 `claude --resume <id>` 在 CLI 中继续。
 
 ## 安装与启动
 
-需要 [uv](https://docs.astral.sh/uv/)，并且 Claude Code 已经登录。
+需要 Python 3.12 或更高版本，以及 Claude Code 的登录凭据：本机已有的登录、启动时提供的 `CLAUDE_CODE_OAUTH_TOKEN` 或 `ANTHROPIC_API_KEY`，或者启动后经 API 登录（见[部署与账号](docs/guide/deployment.md#登录凭据)）。
 
 ```sh
 git clone https://github.com/ayaka14732/claude-sessiond
 cd claude-sessiond
-uv run claude-sessiond    # 监听 http://127.0.0.1:8790/，/docs 为交互式 API 文档
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python claude_sessiond.py  # 监听 http://127.0.0.1:8790/
 ```
 
 新建会话并等待第一条消息的结果，随后继续对话、跟随输出、查看待回答的提示：
@@ -33,10 +35,11 @@ curl -s $B/prompts
 - [会话与消息](docs/guide/sessions.md)：会话的状态、休眠与归档、消息的状态、权限确认与提问、文件回滚。
 - [部署与账号](docs/guide/deployment.md)：登录凭据、多个账号与额度用完时的自动切换、访问控制。
 - [参考](docs/reference.md)：命令行参数、HTTP API、事件格式与 webhook。
-- [实现说明](docs/design.md)：与 CLI 的交互方式、直接发送的控制请求、内存与持久化、验证记录。
+- [实现说明](docs/design.md)：与 CLI 的交互方式、直接发送的控制请求、登录、账号切换、内存与持久化。
 
 文档站的构建方法：
 
 ```sh
-uv run --no-project --with-requirements docs/requirements.txt python -m sphinx -n -W --keep-going -b html docs docs/_build
+pip install -r docs/requirements.txt
+python -m sphinx -n -W --keep-going -b html docs docs/_build
 ```

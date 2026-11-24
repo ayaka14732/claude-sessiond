@@ -59,6 +59,15 @@
 
 会话缺省以 `allow_bypass` 启动，运行中可以用 `PATCH /sessions/{id}` 把权限模式切换为 `bypassPermissions`。未指定 `permission_mode` 时，会话使用设置中的 `defaultMode`；若该值为 `bypassPermissions`，普通工具调用不会产生权限确认。
 
+## 智能体团队
+
+会话可以使用 Claude Code 的智能体团队（agent teams）。在设置的 `env` 中开启 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` 后，主会话用 Agent 工具派生的 teammate 由同一个 `claude` 进程运行。守护进程没有终端，因此应把 `teammateMode` 设为 `in-process`，以下行为均在该模式下验证。若改用环境变量开启，需要用 `--keep-env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` 保留它，否则守护进程启动时会将其清除（见[部署与账号](deployment.md#登录凭据)）。
+
+- teammate 的消息与工具调用照常出现在事件流中，`parent_tool_use_id` 为派生它的 Agent 调用；teammate 的启动、进度与结束另有 `task_started`、`task_progress`、`task_notification` 等系统消息。
+- teammate 需要确认的工具调用与主会话的一样挂起为提示，提示的 `agent_id` 标明发起调用的 teammate。
+- 主会话派生 teammate 后通常先结束当前回合，`wait` 随该回合返回，此时 teammate 可能仍在运行，会话状态为 `running`。teammate 用 SendMessage 回复后，CLI 不经用户消息自行开启新的回合。这个回合同样产生 `result` 事件与 webhook 通知并更新 `last_result`，但不对应任何已发消息，`wait` 等不到它，其结果需要从事件流或 webhook 获取。
+- teammate 与主会话使用同一个账号，额度用完时一同受影响。teammate 遇到限制后提前结束，主会话随即开启的回合在同一个账号下同样失败，于是触发[账号切换](deployment.md#多个账号)。切换会重启进程，仍在运行的 teammate 随之中断，其中正在执行的命令被终止。继续的消息要求主会话用 SendMessage 恢复因额度或重启而停下的 teammate；CLI 从 teammate 自己的会话记录恢复它，它从中断处继续，必要时重新执行被终止的命令。
+
 ## 文件回滚
 
 会话缺省开启文件检查点（`checkpointing`）：Write、Edit 与 NotebookEdit 修改文件之前，CLI 先备份原文件。每条开启回合的消息（状态记录中 `checkpoint` 为真）是一个检查点，`POST /sessions/{id}/rewind` 把文件恢复到该消息被处理之前的状态，`dry_run: true` 只列出将要改动的文件与增删行数。

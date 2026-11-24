@@ -8,8 +8,11 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import secrets
+import shutil
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -18,13 +21,15 @@ from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import uvicorn
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    EffortLevel,
+    PermissionMode,
     PermissionResultAllow,
     PermissionResultDeny,
     RateLimitEvent,
@@ -40,11 +45,9 @@ from claude_agent_sdk import (
     rename_session,
 )
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
-PermissionMode = Literal['default', 'acceptEdits', 'plan', 'bypassPermissions', 'dontAsk', 'auto']
-Effort = Literal['low', 'medium', 'high', 'xhigh', 'max']
 EVENT_BUFFER = 5000
 SENT_HISTORY = 1000
 SSE_KEEPALIVE = 15.0
@@ -56,7 +59,14 @@ DEFAULT_ACCOUNT = 'default'
 LIMIT_ERRORS = ('rate_limit', 'billing_error')
 # How long an account stays unavailable after a rate limit that came without a reset time (API keys get no `rate_limit_event`).
 RATE_LIMIT_COOLDOWN = 300.0
-CONTINUE_PROMPT = 'Continue from where you left off.'
+# Sent after moving a session to another account, worded like the CLI's own note after it restarts a crashed session.
+CONTINUE_PROMPT = 'Continue from where you left off. Note: the previous turn stopped because the account ran into a usage or billing limit, and the session was moved to another account; the user has not sent a new message. The new account is not limited, so do not wait for the limit to reset. Agents you started that stopped because of the limit or of the restart keep their transcripts: resume each of them now by sending it a message with SendMessage.'
+# How long a sign-in waits for the browser to come back.
+LOGIN_TIMEOUT = 900.0
+# Account names that can sign in: each gets a directory of that name.
+LOGIN_NAME = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9._-]*')
+# Credentials in the daemon's environment take precedence over a sign-in stored in the config directory.
+CREDENTIAL_ENV = ('ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN')
 
 def to_jsonable(o: Any) -> Any:
     """Serialize SDK dataclasses losslessly, tagging each with its class name under `_type`."""
@@ -94,10 +104,16 @@ def write_private(path: Path, text: str) -> None:
     """Atomically replace a file with one only its owner can read."""
     tmp = path.with_suffix('.tmp')
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
     with os.fdopen(fd, 'w') as f:
         f.write(text)
     tmp.replace(path)
+
+async def control(client: ClaudeSDKClient, request: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
+    """Send a raw control request and return the CLI's response.
+
+    The Python SDK's `rewind_files()` drops the response and has no dry run, and it wraps neither `cancel_async_message` nor sign-in; the TypeScript SDK sends these same requests and returns the response.
+    """
+    return await client._query._send_control_request(request, timeout)
 
 def scrub_environment(keep: list[str]) -> None:
     """Drop CLAUDE* variables inherited from a parent Claude Code session.
@@ -114,7 +130,7 @@ class SessionConfig(BaseModel):
     name: str | None = None
     model: str | None = None
     permission_mode: PermissionMode | None = None
-    effort: Effort | None = None
+    effort: EffortLevel | None = None
     append_system_prompt: str | None = None
     allowed_tools: list[str] = []
     disallowed_tools: list[str] = []
@@ -125,21 +141,8 @@ class SessionConfig(BaseModel):
     checkpointing: bool = True
     account: str | None = None
 
-class NewSession(BaseModel):
+class NewSession(SessionConfig):
     cwd: str | None = None
-    name: str | None = None
-    model: str | None = None
-    permission_mode: PermissionMode | None = None
-    effort: Effort | None = None
-    append_system_prompt: str | None = None
-    allowed_tools: list[str] = []
-    disallowed_tools: list[str] = []
-    add_dirs: list[str] = []
-    max_budget_usd: float | None = None
-    partial_messages: bool = False
-    allow_bypass: bool = True
-    checkpointing: bool = True
-    account: str | None = None
     resume: str | None = None
     fork: bool = False
     force: bool = False
@@ -151,7 +154,7 @@ class PatchSession(BaseModel):
     name: str | None = None
     model: str | None = None
     permission_mode: PermissionMode | None = None
-    effort: Effort | None = None
+    effort: EffortLevel | None = None
     account: str | None = None
 
 class NewAccount(BaseModel):
@@ -161,7 +164,11 @@ class NewAccount(BaseModel):
     env: dict[str, str] = {}
 
 class Account(NewAccount):
-    """Credentials a session's `claude` process runs under. `default` has none and uses whatever the daemon inherited."""
+    """Credentials a session's `claude` process runs under. `default` has none and uses whatever the daemon inherited.
+
+    An account signed in over the API keeps the CLI's own credentials, refresh token included, in `storage`, which the CLI is pointed to with `CLAUDE_SECURESTORAGE_CONFIG_DIR`; everything else stays in the shared config directory.
+    """
+    storage: str | None = None
     limited: str | None = None
     limited_until: float | None = None
 
@@ -169,20 +176,27 @@ class Account(NewAccount):
         """A billing limit has no reset time and lasts until the account is reset over the API."""
         return self.limited is None or (self.limited_until is not None and self.limited_until <= time.time())
 
+    @property
+    def kind(self) -> str:
+        return 'login' if self.storage is not None else 'oauth_token' if self.oauth_token is not None else 'api_key' if self.api_key is not None else 'inherited'
+
     def environment(self) -> dict[str, str]:
-        """Variables to set for the `claude` process. The other credential variable is set to the empty string, which the CLI treats as unset, so an inherited one cannot take precedence."""
-        if self.oauth_token is not None:
-            base = {'CLAUDE_CODE_OAUTH_TOKEN': self.oauth_token, 'ANTHROPIC_API_KEY': ''}
-        elif self.api_key is not None:
-            base = {'ANTHROPIC_API_KEY': self.api_key, 'CLAUDE_CODE_OAUTH_TOKEN': ''}
-        else:
-            base = {}
+        """Variables to set for the `claude` process. Credential variables not used are set to the empty string, which the CLI treats as unset, so an inherited one cannot take precedence."""
+        blank = {name: '' for name in CREDENTIAL_ENV}
+        match self.kind:
+            case 'login':
+                base = blank | {'CLAUDE_SECURESTORAGE_CONFIG_DIR': self.storage}
+            case 'oauth_token':
+                base = blank | {'CLAUDE_CODE_OAUTH_TOKEN': self.oauth_token}
+            case 'api_key':
+                base = blank | {'ANTHROPIC_API_KEY': self.api_key}
+            case _:
+                base = {}
         return base | self.env
 
     def public(self, sessions: int) -> dict[str, Any]:
         """What the API shows: no secrets, and only the names of extra variables."""
-        kind = 'oauth_token' if self.oauth_token is not None else 'api_key' if self.api_key is not None else 'inherited'
-        return {'name': self.name, 'kind': kind, 'env': sorted(self.env), 'available': self.available(), 'limited': self.limited, 'limited_until': self.limited_until, 'sessions': sessions}
+        return {'name': self.name, 'kind': self.kind, 'env': sorted(self.env), 'available': self.available(), 'limited': self.limited, 'limited_until': self.limited_until, 'sessions': sessions}
 
 class SendMessage(BaseModel):
     text: str
@@ -388,10 +402,7 @@ class Session:
                     self.sent[u]['state'] = 'dropped'
             self.outstanding.clear()
             if not self.switching:
-                for f in self.relayed:
-                    if not f.done():
-                        f.set_result(None)
-                self.relayed.clear()
+                self.release_relayed()
             self.turn_active = False
             self.limit_error = self.limit_resets = None
             # A dormant session keeps nothing but its config in memory; its full history stays readable from the transcript (`/history`). `seq` keeps counting, so event cursors stay valid.
@@ -469,8 +480,10 @@ class Session:
         try:
             previous = self.config.account
             self.config.account = target.name
+            # Taken in by the turn that failed, which has ended: done, and answered by the continuing turn.
             for u in [u for u in self.outstanding if self.sent.get(u, {}).get('state') == 'taken']:
                 self.relayed.append(self.outstanding.pop(u))
+                self.sent[u]['state'] = 'done'
             await self.stop()
             # Announced after stopping, which clears the event buffer.
             self.announce_switch(previous, target.name, reason)
@@ -479,10 +492,7 @@ class Session:
             _, future = await self.send(CONTINUE_PROMPT)
         except Exception as e:
             self.emit('error', {'error': f'switching to account {target.name} failed: {e!r}'})
-            for f in self.relayed:
-                if not f.done():
-                    f.set_result(None)
-            self.relayed.clear()
+            self.release_relayed()
             return
         finally:
             self.switching = False
@@ -494,6 +504,13 @@ class Session:
                     f.set_result(done.result())
 
         future.add_done_callback(forward)
+
+    def release_relayed(self) -> None:
+        """Wake callers relayed to a continuing turn that will not come."""
+        for f in self.relayed:
+            if not f.done():
+                f.set_result(None)
+        self.relayed.clear()
 
     def on_taken(self, u: str) -> None:
         """`--replay-user-messages` echoes a sent message when a turn takes it in. A message that starts a turn is a file checkpoint; one taken in mid-turn is not."""
@@ -547,19 +564,12 @@ class Session:
         await self.client.query(one(), session_id=self.id)
         return u, future
 
-    async def control(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Send a raw control request and return the CLI's response.
-
-        The Python SDK's `rewind_files()` drops the response and has no dry run, and it has no wrapper for `cancel_async_message`; the TypeScript SDK sends these same requests (`dry_run`, `cancel_async_message`) and returns the response.
-        """
-        return await self.client._query._send_control_request(request)
-
     async def cancel(self, u: str) -> bool:
         """Withdraw a message that is still queued (sent mid-turn, not yet taken in)."""
         record = self.sent.get(u)
-        if record is None or record['state'] != 'queued' or self.client is None:
+        if record is None or record['state'] != 'queued':
             return False
-        r = await self.control({'subtype': 'cancel_async_message', 'message_uuid': u})
+        r = await control(self.client, {'subtype': 'cancel_async_message', 'message_uuid': u})
         if r.get('cancelled'):
             record['state'] = 'cancelled'
             f = self.outstanding.pop(u, None)
@@ -570,7 +580,7 @@ class Session:
         return bool(r.get('cancelled'))
 
     async def rewind(self, u: str, dry_run: bool) -> dict[str, Any]:
-        r = await self.control({'subtype': 'rewind_files', 'user_message_id': u, 'dry_run': dry_run})
+        r = await control(self.client, {'subtype': 'rewind_files', 'user_message_id': u, 'dry_run': dry_run})
         if not dry_run and r.get('canRewind'):
             self.emit('rewound', {'uuid': u, **r})
         return r
@@ -633,6 +643,74 @@ class Session:
             updated['response'] = a.response
         prompt.resolve(PermissionResultAllow(updated_input=updated, updated_permissions=prompt.suggestions if a.remember else None), 'answered')
 
+class Login:
+    """A sign-in of one account through the browser, driven through a dedicated `claude` process that runs no session.
+
+    The `claude_authenticate` control request returns the authorization URL (`automaticUrl`), which redirects to a listener of that process on the daemon's machine (`http://localhost:<port>/callback`); it is opened in a browser on that machine, or with that port forwarded to the browser's machine. `claude_oauth_wait_for_completion` answers once the CLI has stored the credentials, as `claude auth login` does: for `default` in the config directory, for any other account in its own directory under the state directory.
+    """
+    def __init__(self, daemon: 'Daemon', name: str) -> None:
+        self.daemon = daemon
+        self.name = name
+        self.status = 'starting'
+        self.url: str | None = None
+        self.profile: dict[str, Any] | None = None
+        self.error: str | None = None
+        self.created = time.time()
+        self.ready = asyncio.get_running_loop().create_future()
+        self.task = asyncio.create_task(self.run())
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            'account': self.name,
+            'status': self.status,
+            'url': self.url,
+            'created': self.created,
+            'expires': self.created + LOGIN_TIMEOUT,
+            'profile': self.profile,
+            'error': self.error,
+        }
+
+    async def run(self) -> None:
+        try:
+            await asyncio.wait_for(self.sign_in(), LOGIN_TIMEOUT)
+            self.status = 'done'
+        except asyncio.CancelledError:
+            self.status = 'cancelled'
+        except Exception as e:
+            self.status = 'failed'
+            self.error = f'the browser did not come back within {LOGIN_TIMEOUT:g} seconds' if isinstance(e, TimeoutError) else str(e)
+        if not self.ready.done():
+            self.ready.set_exception(RuntimeError(self.error or f'the sign-in was {self.status}'))
+
+    async def sign_in(self) -> None:
+        # Empty credential variables make the CLI use, and store into, its secure storage.
+        env = {name: '' for name in CREDENTIAL_ENV}
+        if self.name == DEFAULT_ACCOUNT:
+            r = await self.authenticate(env)
+            self.daemon.reset_account(DEFAULT_ACCOUNT)
+        else:
+            # Signing in again replaces the credentials in the same directory, which sessions already running under the account then pick up.
+            storage = self.daemon.logins_dir / self.name
+            storage.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # A sign-in also records the account's identity (`oauthAccount`) in the config directory's `.claude.json`; a throwaway config directory keeps the shared one describing the default account.
+            with tempfile.TemporaryDirectory(prefix='claude-sessiond-login-') as config:
+                r = await self.authenticate(env | {'CLAUDE_SECURESTORAGE_CONFIG_DIR': str(storage), 'CLAUDE_CONFIG_DIR': config})
+            self.daemon.set_storage(self.name, storage)
+        self.profile = r.get('account')
+
+    async def authenticate(self, env: dict[str, str]) -> dict[str, Any]:
+        options = ClaudeAgentOptions(cwd=str(Path.home()), setting_sources=[], cli_path=self.daemon.cli_path, env=env)
+        async with ClaudeSDKClient(options) as client:
+            urls = await control(client, {'subtype': 'claude_authenticate', 'loginWithClaudeAi': True})
+            self.url = urls['automaticUrl']
+            self.status = 'pending'
+            self.ready.set_result(None)
+            return await control(client, {'subtype': 'claude_oauth_wait_for_completion'}, LOGIN_TIMEOUT)
+
+    async def cancel(self) -> None:
+        self.task.cancel()
+        await asyncio.wait({self.task})
+
 def post_json(url: str, payload: dict[str, Any], token: str | None) -> None:
     headers = {'Content-Type': 'application/json'} | ({'Authorization': f'Bearer {token}'} if token else {})
     request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode(), headers=headers)
@@ -652,6 +730,9 @@ class Daemon:
         # Holds credentials, so it is kept apart from the state file and readable only by its owner. The order is the order in which accounts are tried.
         self.accounts_path = state_path.with_name('accounts.json')
         self.accounts = [Account(name=DEFAULT_ACCOUNT)]
+        self.logins: dict[str, Login] = {}
+        # Each account signed in over the API keeps its credentials in a directory here.
+        self.logins_dir = state_path.with_name('logins')
 
     def load(self) -> None:
         if self.accounts_path.exists():
@@ -659,15 +740,12 @@ class Daemon:
         if not self.state_path.exists():
             return
         for item in json.loads(self.state_path.read_text()):
-            # `seq` and `archived` are absent from state files written before they existed.
-            self.sessions[item['id']] = Session(self, item['id'], SessionConfig(**item['config']), item['created'], item['last_active'], item.get('seq', 0), item.get('archived', False))
+            self.sessions[item['id']] = Session(self, item['id'], SessionConfig(**item['config']), item['created'], item['last_active'], item['seq'], item['archived'])
 
     def save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         items = [{'id': s.id, 'config': s.config.model_dump(), 'created': s.created, 'last_active': s.last_active, 'seq': s.seq, 'archived': s.archived} for s in self.sessions.values()]
-        tmp = self.state_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(items, indent=1, ensure_ascii=False))
-        tmp.replace(self.state_path)
+        write_private(self.state_path, json.dumps(items, indent=1, ensure_ascii=False))
 
     def save_accounts(self) -> None:
         self.accounts_path.parent.mkdir(parents=True, exist_ok=True)
@@ -689,6 +767,21 @@ class Daemon:
             account.limited = reason
             account.limited_until = until
             self.save_accounts()
+
+    def reset_account(self, name: str) -> None:
+        account = self.account(name)
+        account.limited = account.limited_until = None
+        self.save_accounts()
+
+    def set_storage(self, name: str, storage: Path) -> None:
+        """Give an account the credentials of a sign-in, registering it if it does not exist yet; a token or API key it had is dropped."""
+        account = self.account(name)
+        if account is None:
+            account = Account(name=name)
+            self.accounts.append(account)
+        account.storage = str(storage)
+        account.oauth_token = account.api_key = account.limited = account.limited_until = None
+        self.save_accounts()
 
     def get(self, session_id: str) -> Session:
         s = self.sessions.get(session_id)
@@ -721,6 +814,7 @@ class Daemon:
                     await s.stop()
 
     async def shutdown(self) -> None:
+        await asyncio.gather(*(login.cancel() for login in self.logins.values()))
         await asyncio.gather(*(s.stop() for s in self.sessions.values()))
         self.save()
 
@@ -734,7 +828,8 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
             t.cancel()
         await daemon.shutdown()
 
-    app = FastAPI(title='claude-sessiond', lifespan=lifespan)
+    # No Swagger UI or ReDoc pages; `/openapi.json` stays for clients.
+    app = FastAPI(title='claude-sessiond', lifespan=lifespan, docs_url=None, redoc_url=None)
 
     @app.middleware('http')
     async def guard(request: Request, call_next: Any) -> Any:
@@ -776,22 +871,22 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
     @app.post('/sessions', status_code=201)
     async def new_session(body: NewSession) -> dict[str, Any]:
         fields = body.model_dump(include=set(SessionConfig.model_fields))
-        if body.account is not None and daemon.account(body.account) is None:
-            raise HTTPException(400, f'unknown account {body.account}')
+        if body.cwd is not None:
+            fields['cwd'] = str(Path(body.cwd).expanduser().resolve())
+        check_account(body.account)
         if body.resume is not None:
-            info = get_session_info(body.resume, directory=body.cwd)
+            info = get_session_info(body.resume, directory=fields['cwd'])
             if info is None:
                 raise HTTPException(404, f'no transcript for session {body.resume}')
-            fields['cwd'] = body.cwd or info.cwd
+            fields['cwd'] = fields['cwd'] or info.cwd
             session_id = fork_session(body.resume, directory=fields['cwd'], title=body.name).session_id if body.fork else body.resume
             if session_id in daemon.sessions:
                 hint = ' (archived; send it a message or unarchive it)' if daemon.sessions[session_id].archived else ''
                 raise HTTPException(409, f'session {session_id} is already hosted{hint}')
         else:
-            if body.cwd is None or not Path(body.cwd).is_dir():
+            if fields['cwd'] is None or not Path(fields['cwd']).is_dir():
                 raise HTTPException(400, 'cwd must be an existing directory')
             session_id = str(uuid.uuid4())
-        fields['cwd'] = str(Path(fields['cwd']).expanduser().resolve())
         now = time.time()
         s = Session(daemon, session_id, SessionConfig(**fields), now, now)
         daemon.sessions[session_id] = s
@@ -813,8 +908,7 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
     @app.patch('/sessions/{session_id}')
     async def patch_session(session_id: str, body: PatchSession) -> dict[str, Any]:
         s = daemon.get(session_id)
-        if body.account is not None and daemon.account(body.account) is None:
-            raise HTTPException(400, f'unknown account {body.account}')
+        check_account(body.account)
         if body.name is not None:
             s.config.name = body.name
             if get_session_info(s.id, directory=s.config.cwd) is not None:
@@ -931,7 +1025,7 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
     @app.get('/sessions/{session_id}/log')
     async def log(session_id: str, after: int = 0, wait: float = 0.0) -> dict[str, Any]:
         s = daemon.get(session_id)
-        batch = await s.wait_events(after, min(wait, 60.0)) if wait > 0 else s.events_after(after)
+        batch = await s.wait_events(after, min(wait, 60.0))
         return {'events': batch, 'seq': s.seq, 'status': s.status}
 
     @app.get('/sessions/{session_id}/history')
@@ -955,9 +1049,16 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
         daemon.get(session_id).answer(prompt_id, body)
         return {'id': prompt_id, 'allow': body.allow}
 
+    def public_account(account: Account) -> dict[str, Any]:
+        return account.public(sum(s.config.account == account.name for s in daemon.sessions.values()))
+
+    def check_account(name: str | None) -> None:
+        if name is not None and daemon.account(name) is None:
+            raise HTTPException(400, f'unknown account {name}')
+
     @app.get('/accounts')
     async def accounts() -> list[dict[str, Any]]:
-        return [a.public(sum(s.config.account == a.name for s in daemon.sessions.values())) for a in daemon.accounts]
+        return [public_account(a) for a in daemon.accounts]
 
     @app.post('/accounts', status_code=201)
     async def add_account(body: NewAccount) -> dict[str, Any]:
@@ -980,16 +1081,58 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
     async def remove_account(name: str) -> dict[str, Any]:
         if name == DEFAULT_ACCOUNT:
             raise HTTPException(400, 'the default account cannot be removed')
-        daemon.accounts.remove(get_account(name))
+        account = get_account(name)
+        daemon.accounts.remove(account)
         daemon.save_accounts()
+        if account.storage is not None:
+            shutil.rmtree(account.storage, ignore_errors=True)
         return {'name': name}
 
     @app.post('/accounts/{name}/reset')
     async def reset_account(name: str) -> dict[str, Any]:
         account = get_account(name)
-        account.limited = account.limited_until = None
-        daemon.save_accounts()
-        return account.public(sum(s.config.account == name for s in daemon.sessions.values()))
+        daemon.reset_account(name)
+        return public_account(account)
+
+    def get_login(name: str) -> Login:
+        login = daemon.logins.get(name)
+        if login is None:
+            raise HTTPException(404, f'no sign-in has been started for account {name}')
+        return login
+
+    @app.post('/accounts/{name}/login')
+    async def start_login(name: str) -> dict[str, Any]:
+        overriding = [v for v in CREDENTIAL_ENV if os.environ.get(v)]
+        if name == DEFAULT_ACCOUNT and overriding:
+            raise HTTPException(409, f'the daemon was started with {overriding[0]}, which sessions under the default account use instead of a sign-in')
+        if not LOGIN_NAME.fullmatch(name):
+            raise HTTPException(400, 'an account that signs in is named with letters, digits, ".", "_" and "-", not starting with "."')
+        if name in daemon.logins:
+            await daemon.logins[name].cancel()
+        login = daemon.logins[name] = Login(daemon, name)
+        try:
+            await login.ready
+        except Exception as e:
+            raise HTTPException(502, f'failed to start the sign-in: {e}')
+        return login.summary()
+
+    @app.get('/accounts/{name}/login')
+    async def login_status(name: str) -> dict[str, Any]:
+        return get_login(name).summary()
+
+    @app.get('/accounts/{name}/login/open')
+    async def open_login(name: str) -> RedirectResponse:
+        """A short address that redirects a browser to the authorization URL, which is too long to copy or click reliably."""
+        login = get_login(name)
+        if login.status != 'pending':
+            raise HTTPException(409, f'the sign-in for account {name} is {login.status}')
+        return RedirectResponse(login.url, status_code=302)
+
+    @app.delete('/accounts/{name}/login')
+    async def cancel_login(name: str) -> dict[str, Any]:
+        login = get_login(name)
+        await login.cancel()
+        return login.summary()
 
     @app.get('/transcripts')
     async def transcripts(cwd: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
