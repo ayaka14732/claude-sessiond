@@ -36,6 +36,8 @@
 | `GET /sessions/{id}/events` | SSE 事件流；`?after=<seq>` 或 `Last-Event-ID` 从指定位置之后续传 |
 | `GET /sessions/{id}/log` | JSON 形式的同一事件流；`?after=<seq>&wait=<秒>` 长轮询，最长 60 秒 |
 | `GET /sessions/{id}/history` | 会话记录中的完整历史，休眠的会话同样可读；`?limit=&offset=` 分页，`offset` 为负数时从末尾算起，例如 `?offset=-200` 取最后 200 条；`?before=<uuid>&limit=` 取这条消息之前的 `limit` 条，会话记录仍在增长时也不会错位 |
+| `GET /sessions/{id}/agents` | 会话的子智能体，包括子智能体派生的子智能体；每项含 `agent_id`、会话记录的修改时间 `modified` 与 CLI 写在会话记录旁的元数据 `meta`（原样转发，例如派生它的 Agent 调用 `toolUseId`、派生它的子智能体 `parentAgentId`、`agentType`、`name`、`description`、`finished`），休眠的会话同样可读 |
+| `GET /sessions/{id}/agents/{agent_id}/history` | 一个子智能体的会话记录；`?limit=&offset=` 分页，`offset` 不能为负数 |
 | `GET /sessions/{id}/context` | 上下文用量，仅限活跃的会话 |
 | `GET /sessions/{id}/info` | CLI 的初始化信息，包括可用的斜杠命令（`commands`）、智能体（`agents`）、模型（`models`）、输出风格与 CLI 版本，仅限活跃的会话 |
 | `POST /sessions/{id}/tasks/{task_id}/stop` | 停止一个子智能体或后台任务；`task_id` 取自 `task_started` 系统消息，停止后 CLI 输出状态为终态的 `task_updated`，仅限活跃的会话 |

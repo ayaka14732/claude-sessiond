@@ -65,6 +65,7 @@ CLI 只在 dry run 的响应中给出 `filesChanged`、`insertions` 与 `deletio
 `requirements.txt` 把 SDK 固定在已验证的版本上。升级 SDK 之后，应首先确认以下依赖仍然成立，并重新验证撤回、回滚、登录、中断、后台任务与定时任务：
 
 - 私有方法 `_query._send_control_request` 与私有属性 `client._transport._process.pid`（见“内存与持久化”）。
+- `GET /sessions/{id}/agents` 用 SDK 的私有函数 `_resolve_subagents_dir`、`_collect_agent_files` 与 `_read_agent_metadata_sidecar` 找到子智能体的会话记录并读取旁边的 `agent-<id>.meta.json`；SDK 的公开接口只给出子智能体的 ID。`meta` 的字段由 CLI 决定，守护进程原样转发。
 - 带 `spare_background_tasks` 的 `interrupt` 控制请求，这个字段是 CLI 标为内部的字段。
 - `background_tasks_changed` 不被 SDK 解析为专门的类型，守护进程从通用 `SystemMessage` 的 `data['tasks']` 读取列表；每个回合开始时的 `init` 系统消息。
 - Stop hook 输入中的 `session_crons`，以及 CronCreate、CronDelete、ScheduleWakeup 结果的结构。

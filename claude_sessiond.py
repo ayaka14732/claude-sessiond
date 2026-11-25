@@ -50,9 +50,11 @@ from claude_agent_sdk import (
     fork_session,
     get_session_info,
     get_session_messages,
+    get_subagent_messages,
     list_sessions,
     rename_session,
 )
+from claude_agent_sdk._internal.sessions import _collect_agent_files, _read_agent_metadata_sidecar, _resolve_subagents_dir
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
@@ -1220,6 +1222,20 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
             return to_jsonable(messages if limit is None else messages[max(0, len(messages) - limit):])
         messages = messages[offset:]
         return to_jsonable(messages if limit is None else messages[:limit])
+
+    @app.get('/sessions/{session_id}/agents')
+    async def agents(session_id: str) -> list[dict[str, Any]]:
+        """The session's subagents, nested ones included: each has a transcript of its own beside the session's, and a sidecar with what the CLI records about it (the Agent call that spawned it, the spawning subagent, its type, name and description). The SDK lists the ids but has no public way to read the sidecars."""
+        s = daemon.get(session_id)
+        base = _resolve_subagents_dir(s.id, s.config.cwd)
+        if base is None:
+            return []
+        return [{'agent_id': agent_id, 'modified': path.stat().st_mtime, 'meta': _read_agent_metadata_sidecar(path) or {}} for agent_id, path in _collect_agent_files(base)]
+
+    @app.get('/sessions/{session_id}/agents/{agent_id}/history')
+    async def agent_history(session_id: str, agent_id: str, limit: int | None = None, offset: int = 0) -> list[Any]:
+        s = daemon.get(session_id)
+        return to_jsonable(get_subagent_messages(s.id, agent_id, directory=s.config.cwd, limit=limit, offset=offset))
 
     @app.get('/sessions/{session_id}/context')
     async def context(session_id: str) -> Any:
