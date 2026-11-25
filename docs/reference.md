@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | `--host`、`--port` | `127.0.0.1`、`8790` | 监听地址 |
 | `--token` | `$SESSIOND_TOKEN` | 设置后，所有请求必须带 `Authorization: Bearer <token>` 或查询参数 `?token=` |
-| `--allow-host` | 无 | 额外接受的 Host 头，可重复指定 |
+| `--allow-host` | 无 | 额外接受的 Host 头（以及非 GET 请求的 Origin 头中的主机名），可重复指定 |
 | `--idle-timeout` | `1800` | 会话空闲多少秒后进入休眠 |
 | `--prompt-timeout` | `3600` | 提示最多等待多少秒，超时按拒绝处理；`0` 表示一直等待 |
 | `--webhook`、`--webhook-token` | `$SESSIOND_WEBHOOK`、`$SESSIOND_WEBHOOK_TOKEN` | 通知的目标地址与随通知发送的 bearer token |
@@ -35,8 +35,10 @@
 | `POST /sessions/{id}/archive`、`/unarchive` | 归档或取消归档 |
 | `GET /sessions/{id}/events` | SSE 事件流；`?after=<seq>` 或 `Last-Event-ID` 从指定位置之后续传 |
 | `GET /sessions/{id}/log` | JSON 形式的同一事件流；`?after=<seq>&wait=<秒>` 长轮询，最长 60 秒 |
-| `GET /sessions/{id}/history` | 会话记录中的完整历史，休眠的会话同样可读 |
+| `GET /sessions/{id}/history` | 会话记录中的完整历史，休眠的会话同样可读；`?limit=&offset=` 分页，`offset` 为负数时从末尾算起，例如 `?offset=-200` 取最后 200 条；`?before=<uuid>&limit=` 取这条消息之前的 `limit` 条，会话记录仍在增长时也不会错位 |
 | `GET /sessions/{id}/context` | 上下文用量，仅限活跃的会话 |
+| `GET /sessions/{id}/info` | CLI 的初始化信息，包括可用的斜杠命令（`commands`）、智能体（`agents`）、模型（`models`）、输出风格与 CLI 版本，仅限活跃的会话 |
+| `POST /sessions/{id}/tasks/{task_id}/stop` | 停止一个子智能体、teammate 或后台任务；`task_id` 取自 `task_started` 系统消息，停止后 CLI 输出状态为终态的 `task_updated`，仅限活跃的会话 |
 | `GET /prompts` | 所有会话中待回答的提示 |
 | `POST /sessions/{id}/prompts/{prompt_id}` | 回答提示，格式见[权限确认与提问](guide/sessions.md#权限确认与提问) |
 | `GET /transcripts` | 本机的会话记录（`?cwd=` 筛选），标明是否已托管、是否已归档、是否正被某个进程打开 |

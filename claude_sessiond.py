@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import warnings
@@ -580,8 +581,12 @@ class Session:
         return bool(r.get('cancelled'))
 
     async def rewind(self, u: str, dry_run: bool) -> dict[str, Any]:
-        r = await control(self.client, {'subtype': 'rewind_files', 'user_message_id': u, 'dry_run': dry_run})
-        if not dry_run and r.get('canRewind'):
+        """The CLI reports the files and line counts only for a dry run; an actual rewind is preceded by one so that its response and the `rewound` event carry them too."""
+        r = await control(self.client, {'subtype': 'rewind_files', 'user_message_id': u, 'dry_run': True})
+        if dry_run or not r.get('canRewind'):
+            return r
+        r |= await control(self.client, {'subtype': 'rewind_files', 'user_message_id': u, 'dry_run': False})
+        if r.get('canRewind'):
             self.emit('rewound', {'uuid': u, **r})
         return r
 
@@ -837,6 +842,10 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
         hostname = host[1:host.index(']')] if host.startswith('[') else host.rsplit(':', 1)[0]
         if hostname not in allowed_hosts:
             return JSONResponse({'detail': f'host {host!r} not allowed'}, status_code=403)
+        # A cross-site page can send a POST without a body (e.g. /interrupt, /accounts/default/login) with no preflight; browsers mark it with the page's Origin.
+        origin = request.headers.get('origin')
+        if origin is not None and request.method not in ('GET', 'HEAD') and urllib.parse.urlsplit(origin).hostname not in allowed_hosts:
+            return JSONResponse({'detail': f'origin {origin!r} not allowed'}, status_code=403)
         if token is not None:
             given = request.headers.get('authorization', '').removeprefix('Bearer ') or request.query_params.get('token', '')
             if not secrets.compare_digest(given.encode(), token.encode()):
@@ -1029,9 +1038,20 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
         return {'events': batch, 'seq': s.seq, 'status': s.status}
 
     @app.get('/sessions/{session_id}/history')
-    async def history(session_id: str, limit: int | None = None, offset: int = 0) -> list[Any]:
+    async def history(session_id: str, limit: int | None = None, offset: int = 0, before: str | None = None) -> list[Any]:
+        """Page through a transcript that may still be growing. A negative `offset` counts from the end, and `before` takes the messages that precede the one with that uuid, so a client can read the latest messages and then earlier ones without knowing the length."""
         s = daemon.get(session_id)
-        return to_jsonable(get_session_messages(s.id, directory=s.config.cwd, limit=limit, offset=offset))
+        if before is None and offset >= 0:
+            return to_jsonable(get_session_messages(s.id, directory=s.config.cwd, limit=limit, offset=offset))
+        messages = get_session_messages(s.id, directory=s.config.cwd)
+        if before is not None:
+            end = next((i for i, m in enumerate(messages) if m.uuid == before), None)
+            if end is None:
+                raise HTTPException(404, f'no message {before} in the transcript')
+            messages = messages[:end]
+            return to_jsonable(messages if limit is None else messages[max(0, len(messages) - limit):])
+        messages = messages[offset:]
+        return to_jsonable(messages if limit is None else messages[:limit])
 
     @app.get('/sessions/{session_id}/context')
     async def context(session_id: str) -> Any:
@@ -1039,6 +1059,21 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
         if s.client is None:
             raise HTTPException(409, 'session is dormant')
         return to_jsonable(await s.client.get_context_usage())
+
+    @app.get('/sessions/{session_id}/info')
+    async def info(session_id: str) -> Any:
+        s = daemon.get(session_id)
+        if s.client is None:
+            raise HTTPException(409, 'session is dormant')
+        return to_jsonable(await s.client.get_server_info())
+
+    @app.post('/sessions/{session_id}/tasks/{task_id}/stop')
+    async def stop_task(session_id: str, task_id: str) -> dict[str, Any]:
+        s = daemon.get(session_id)
+        if s.client is None:
+            raise HTTPException(409, 'session is dormant')
+        await s.client.stop_task(task_id)
+        return {'task_id': task_id}
 
     @app.get('/prompts')
     async def prompts() -> list[dict[str, Any]]:

@@ -40,6 +40,8 @@ Python SDK 的 `rewind_files()` 丢弃 CLI 的响应，不支持 dry run，SDK �
 | `{"subtype": "claude_authenticate", "loginWithClaudeAi": true}` | `automaticUrl` |
 | `{"subtype": "claude_oauth_wait_for_completion"}` | `account` |
 
+CLI 只在 dry run 的响应中给出 `filesChanged`、`insertions` 与 `deletions`，实际回滚的响应只有 `canRewind`。因此实际回滚之前，守护进程先做一次 dry run，把其中的统计并入响应与 `rewound` 事件。
+
 `requirements.txt` 把 SDK 固定在已验证的版本上。升级 SDK 之后，应首先确认 `_query._send_control_request` 仍然存在，并重新验证撤回、回滚与登录。
 
 ## 登录
