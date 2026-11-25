@@ -2,6 +2,42 @@
 
 claude-sessiond 以启动它的用户的身份运行会话：会话中的命令拥有该用户的全部权限，使用该用户的 Claude Code 设置。
 
+## 常驻运行
+
+在 SSH 会话的前台或编辑器的远程终端中启动的守护进程，会随 SSH 连接或编辑器的远程服务一同结束，它托管的会话也随之停止。需要长期运行时，应以 systemd 用户服务运行守护进程，并为该用户开启 lingering，使用户的 systemd 实例在没有任何登录会话时也保持运行：
+
+```sh
+loginctl enable-linger
+```
+
+服务文件 `~/.config/systemd/user/claude-sessiond.service` 的示例如下，路径按实际的安装位置修改，命令行参数附加在 `ExecStart` 之后：
+
+```ini
+[Unit]
+Description=claude-sessiond
+
+[Service]
+ExecStart=%h/claude-sessiond/.venv/bin/python %h/claude-sessiond/claude_sessiond.py
+EnvironmentFile=-%h/.config/claude-sessiond/env
+KillMode=mixed
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now claude-sessiond
+journalctl --user -u claude-sessiond -f
+```
+
+- `KillMode=mixed` 使 SIGTERM 只发给守护进程，由它逐个停止会话的 `claude` 进程，systemd 随后才结束残留的进程。缺省的 `control-group` 同时向服务中的所有进程发送 SIGTERM，`claude` 进程先于守护进程退出，会话以进程异常退出告终。守护进程异常退出时，systemd 以 SIGKILL 结束服务中残留的 `claude` 进程与后台命令，再按 `Restart=on-failure` 重新启动守护进程。
+- 收到 SIGTERM 后，守护进程最多等待 5 秒，让进行中的 HTTP 请求结束，随后断开事件流与仍在等待的请求，再停止所有会话。日志中先记一行 `Cancel N running task(s), timeout graceful shutdown exceeded`，每个被断开的请求再留下一段 `Exception in ASGI application` 与以 `CancelledError` 结尾的 traceback，这些都是预期的。进行中的回合随之中止，会话以休眠状态保留，服务重新启动后照常恢复。
+- `EnvironmentFile` 中可以给出 `SESSIOND_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN` 等变量，每行一个 `名称=值`，文件权限应为 600；路径前的 `-` 表示文件不存在时忽略。
+
+会话中的命令继承服务的环境，而不是登录 shell 的环境：`~/.profile`、`~/.zprofile` 等登录时读取的文件中设置的变量都不存在，SSH 登录时转发的 `SSH_AUTH_SOCK` 也不存在。Claude Code 为 Bash 工具生成 shell 快照时会读取用户的 shell 配置文件（如 `~/.zshrc`、`~/.bashrc`），但只保留其中的 `PATH`、函数、别名与 shell 选项，配置文件中导出的其他变量不会出现在命令的环境中。会话需要的变量应在服务文件中用 `Environment=` 设置，或写入 `EnvironmentFile`；其中的 `CLAUDE_*` 变量还需要用 `--keep-env` 保留（见下一节）。
+
 ## 登录凭据
 
 守护进程启动时清除继承来的 `CLAUDECODE` 与 `CLAUDE_*` 环境变量，只保留 `CLAUDE_CONFIG_DIR`、`CLAUDE_CODE_OAUTH_TOKEN` 与 `--keep-env` 指定的变量；`ANTHROPIC_*` 不受影响。因此，在没有浏览器的服务器上可以把 `claude setup-token` 生成的 token 作为 `CLAUDE_CODE_OAUTH_TOKEN` 提供给守护进程，也可以使用 `ANTHROPIC_API_KEY` 或已有的登录凭据。若在某个 Claude Code 会话内启动守护进程，被清除的变量会使新会话被当作那个会话的子会话，不保存会话记录。

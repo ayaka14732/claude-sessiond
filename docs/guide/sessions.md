@@ -7,31 +7,38 @@
 | 状态 | 含义 |
 | --- | --- |
 | `starting` | `claude` 进程正在启动，通常约 0.5 秒 |
-| `idle` | 进程在运行，没有进行中的回合 |
-| `running` | 回合进行中，或者有已发出但尚未被回合吸收的消息 |
+| `idle` | 进程在运行，主会话没有进行中的回合；后台任务、子智能体与 teammate 可能仍在运行 |
+| `running` | 回合进行中（包括 CLI 自行开启的回合），或者有已发出但尚未被回合吸收的消息 |
 | `waiting` | 有待回答的权限确认或提问 |
 | `dormant` | 没有进程；会话记录保留在磁盘上 |
 
-会话空闲超过 `--idle-timeout` 秒（缺省 30 分钟）、收到 `/stop` 或进程异常退出后进入休眠：进程退出，内存中的事件缓冲同时清空。每个活跃进程约占 280 MB 内存，休眠的会话只保留配置。之后发送消息、调用 `/start` 或 `/rewind` 时，守护进程从会话记录恢复进程，上下文保持不变。
+会话空闲超过 `--idle-timeout` 秒（缺省 30 分钟）、收到 `/stop` 或进程异常退出后进入休眠：进程退出，内存中的事件缓冲同时清空。每个活跃进程约占 280 MB 内存，休眠的会话只保留配置。之后发送消息、调用 `/start` 或 `/rewind` 时，守护进程从会话记录恢复进程，上下文保持不变；进程正在退出时到达的这些请求等它退出后再恢复。
 
-事件序号 `seq` 在休眠和守护进程重启之后继续递增，客户端保存的 `after` 或 `Last-Event-ID` 始终有效。已清空的早期事件可以通过 `/history` 从会话记录读取。
+进程退出时，其中的后台任务随之终止，结果不会再返回；会话内的定时任务也只存在于进程中，进程退出后不再按时触发。因此有这两类工作时，空闲的会话不会休眠：
 
-恢复之前，守护进程检查该会话是否正被另一个 Claude Code 进程打开（例如 VS Code 或另一个守护进程）。若是，请求返回 409，以免两个进程同时写同一份会话记录；确需打开时传入 `force: true`。
+- 后台任务包括 `run_in_background` 的 Bash 命令、Monitor 与后台子智能体，列在 `GET /sessions/{id}` 的 `background_tasks` 中。任务结束后，CLI 自行开启一个回合报告结果，空闲时间从这个回合结束时起算。不会自行结束的任务（例如开发服务器或 `tail -f`）使会话一直保持活跃，可以用 `POST /sessions/{id}/tasks/{task_id}/stop` 停止任务。
+- 定时任务由 ScheduleWakeup 或 CronCreate 创建，列在 `crons` 中；`fires_at` 为一次性定时任务的触发时间（已知时），`wakeup` 标明由 ScheduleWakeup 创建。守护进程跟随这些工具的结果更新列表，并在每个正常结束的回合以 CLI 给出的列表校准。一次性的定时任务（包括 ScheduleWakeup）触发后即被移除，触发时间过去两分钟后也不再使会话保持活跃；周期性的定时任务使会话一直保持活跃，直到被删除或到期（CLI 缺省为 30 天）。`durable` 的定时任务保存在项目的 `.claude/scheduled_tasks.json` 中，不列在 `crons` 中，也不使会话保持活跃，会话休眠期间不会触发。
+
+`/stop`、归档与删除不受影响，照常停止进程，后台任务随之消失。CronCreate 创建的定时任务在会话休眠期间不触发；再次启动时，CLI 从会话记录恢复尚未到期的那些（已过触发时间的一次性任务被丢弃），守护进程也把触发时间已知的那些保存在状态文件中，因此只启动而不发消息的会话同样等到它们触发，守护进程重启之后也是如此。ScheduleWakeup 安排的唤醒不会恢复。
+
+事件序号 `seq` 在休眠和守护进程重启之后继续递增，守护进程异常退出后也不会回退，客户端保存的 `after` 或 `Last-Event-ID` 始终有效；异常退出之后的序号可能跳过一段。已清空的早期事件可以通过 `/history` 从会话记录读取。
+
+恢复之前，守护进程检查该会话是否正被另一个 Claude Code 进程打开（例如 VS Code 或另一个守护进程）。若是，请求返回 409，以免两个进程同时写同一份会话记录；确需打开时传入 `force: true`。登记该会话的进程已经退出、或其 pid 已被其他进程复用时，不算占用。例外是守护进程自己此前启动的进程：守护进程被强制结束后，仍有后台任务的 `claude` 进程不随之退出，恢复时守护进程先结束这个进程（其中的后台任务一同终止），再照常恢复。这两种判断都依赖 `/proc` 中的进程启动时间，只在 Linux 上进行；其他系统上，pid 已被其他进程复用的过期登记与守护进程自己留下的进程都使请求返回 409；pid 已不存在的登记照常不算占用。
 
 ### 归档与删除
 
 不再使用的会话可以归档或删除，两者都会中止进行中的回合：
 
 - **归档**（`POST /sessions/{id}/archive`）：停止进程，清空事件缓冲与已发消息的记录，并从 `GET /sessions` 的缺省结果中隐藏（`?include_archived=true` 时列出）。再次发送消息、调用 `/start` 或 `/rewind` 时自动取消归档；`/unarchive` 只取消归档，不启动进程。
-- **删除**（`DELETE /sessions/{id}`）：不再托管该会话，会话记录保留，以后可以用 `POST /sessions` 的 `resume` 字段重新托管；加上 `?purge=true` 时同时删除会话记录。
+- **删除**（`DELETE /sessions/{id}`）：不再托管该会话，删除期间到达的请求返回 404。会话记录保留，以后可以用 `POST /sessions` 的 `resume` 字段重新托管；加上 `?purge=true` 时同时删除会话记录。
 
 `POST /sessions` 的 `resume` 字段也可以托管在 CLI 或 IDE 中创建的会话，`GET /transcripts` 列出本机所有会话记录；同时指定 `fork: true` 时先复制一份再托管。
 
 ## 消息
 
-`POST /sessions/{id}/messages` 发送一条消息。`wait: true` 使请求等到吸收这条消息的回合结束，并返回该回合的结果；`timeout` 秒内没有结束时先返回 `timed_out`。`interrupt: true` 先中断进行中的回合。
+`POST /sessions/{id}/messages` 发送一条消息。`wait: true` 使请求等到吸收这条消息的回合结束，并返回该回合的结果；`timeout` 秒内没有结束时先返回 `timed_out`。`interrupt: true` 先中断进行中的回合。中断（包括 `POST /sessions/{id}/interrupt`）只结束主会话的回合，后台任务与子智能体继续运行；尚未被吸收的消息也不受影响，由之后的回合照常处理。
 
-回合进行中发出的消息不会等到下一个回合，而是在当前工具调用结束时被当前回合吸收。守护进程根据 CLI 的回送记录每条消息的状态，可以通过 `GET /sessions/{id}/messages` 查询：
+回合进行中发出的消息不会等到下一个回合，而是在当前工具调用结束时被当前回合吸收；被 CLI 自行开启的回合（例如报告后台任务结果的回合）吸收时，`wait` 返回的是那个回合的结果。守护进程根据 CLI 的回送记录每条消息的状态，可以通过 `GET /sessions/{id}/messages` 查询：
 
 | 状态 | 含义 |
 | --- | --- |
@@ -39,7 +46,7 @@
 | `taken` | 已被回合吸收；`checkpoint` 为真表示这条消息开启了该回合 |
 | `done` | 吸收它的回合已经结束 |
 | `cancelled` | 已撤回 |
-| `dropped` | 回合被中断或会话停止时尚未被吸收 |
+| `dropped` | 会话停止时尚未被吸收，或吸收它的回合尚未结束 |
 
 ## 权限确认与提问
 
@@ -65,9 +72,11 @@
 
 - teammate 的消息与工具调用照常出现在事件流中，`parent_tool_use_id` 为派生它的 Agent 调用；teammate 的启动、进度与结束另有 `task_started`、`task_progress`、`task_notification` 等系统消息。
 - teammate 需要确认的工具调用与主会话的一样挂起为提示，提示的 `agent_id` 标明发起调用的 teammate。
-- 主会话派生 teammate 后通常先结束当前回合，`wait` 随该回合返回，此时 teammate 可能仍在运行，会话状态为 `running`。teammate 用 SendMessage 回复后，CLI 不经用户消息自行开启新的回合。这个回合同样产生 `result` 事件与 webhook 通知并更新 `last_result`，但不对应任何已发消息，`wait` 等不到它，其结果需要从事件流或 webhook 获取。
+- 主会话派生 teammate 后通常先结束当前回合，`wait` 随该回合返回，此时 teammate 可能仍在运行；teammate 的消息不改变会话的状态。teammate 用 SendMessage 回复后，CLI 不经用户消息自行开启新的回合。这个回合同样产生 `result` 事件与 webhook 通知并更新 `last_result`，但不对应任何已发消息，`wait` 等不到它，其结果需要从事件流或 webhook 获取。
 - 运行中的 teammate、子智能体与后台任务可以用 `POST /sessions/{id}/tasks/{task_id}/stop` 单独停止，主会话的回合不受影响。
 - teammate 与主会话使用同一个账号，额度用完时一同受影响。teammate 遇到限制后提前结束，主会话随即开启的回合在同一个账号下同样失败，于是触发[账号切换](deployment.md#多个账号)。切换会重启进程，仍在运行的 teammate 随之中断，其中正在执行的命令被终止。继续的消息要求主会话用 SendMessage 恢复因额度或重启而停下的 teammate；CLI 从 teammate 自己的会话记录恢复它，它从中断处继续，必要时重新执行被终止的命令。
+
+空闲的 teammate 仍是运行中的后台任务，`background_tasks` 中没有区分空闲与否的字段，因此团队存在期间会话不会休眠。不再需要的 teammate 应由主会话关闭，或用 `/tasks/{task_id}/stop` 停止；会话休眠或被 `/stop` 时，teammate 随进程结束。
 
 ## 文件回滚
 

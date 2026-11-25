@@ -1,6 +1,6 @@
 """claude-sessiond: an HTTP daemon that hosts Claude Code sessions through the Claude Agent SDK.
 
-Each hosted session is one long-lived `ClaudeSDKClient` (one `claude` subprocess). Messages are sent as ordinary user messages, exactly as if typed in the CLI. Permission prompts and AskUserQuestion calls are held open and answered over HTTP, or declined after a timeout. Idle sessions are put to sleep (subprocess exits, event buffer dropped) and resumed transparently from their transcript on the next message. Archived sessions are hidden from the session list until used again. When a turn fails on a usage or billing limit, the session moves to the next available account and continues.
+Each hosted session is one long-lived `ClaudeSDKClient` (one `claude` subprocess). Messages are sent as ordinary user messages, exactly as if typed in the CLI. Permission prompts and AskUserQuestion calls are held open and answered over HTTP, or declined after a timeout. Idle sessions with no background tasks or scheduled wakeups are put to sleep (subprocess exits, event buffer dropped) and resumed transparently from their transcript on the next message. Archived sessions are hidden from the session list until used again. When a turn fails on a usage or billing limit, the session moves to the next available account and continues.
 """
 
 import argparse
@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -30,13 +31,20 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     EffortLevel,
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    HookMatcher,
     PermissionMode,
     PermissionResultAllow,
     PermissionResultDeny,
     RateLimitEvent,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     ToolPermissionContext,
+    ToolResultBlock,
+    ToolUseBlock,
     UserMessage,
     delete_session,
     fork_session,
@@ -50,6 +58,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 EVENT_BUFFER = 5000
+# Event numbers handed out ahead of the state file: it always holds a `seq` no event has reached, so numbering after a crash resumes above every event a client saw.
+SEQ_RESERVE = 1000
 SENT_HISTORY = 1000
 SSE_KEEPALIVE = 15.0
 LOCAL_HOSTS = {'127.0.0.1', 'localhost', '::1'}
@@ -61,11 +71,15 @@ LIMIT_ERRORS = ('rate_limit', 'billing_error')
 # How long an account stays unavailable after a rate limit that came without a reset time (API keys get no `rate_limit_event`).
 RATE_LIMIT_COOLDOWN = 300.0
 # Sent after moving a session to another account, worded like the CLI's own note after it restarts a crashed session.
-CONTINUE_PROMPT = 'Continue from where you left off. Note: the previous turn stopped because the account ran into a usage or billing limit, and the session was moved to another account; the user has not sent a new message. The new account is not limited, so do not wait for the limit to reset. Agents you started that stopped because of the limit or of the restart keep their transcripts: resume each of them now by sending it a message with SendMessage.'
+CONTINUE_PROMPT = 'Continue from where you left off. Note: the previous turn stopped because the account ran into a usage or billing limit, and the session was moved to another account; the user has not sent a new message. The new account is not limited, so do not wait for the limit to reset. Agents you started that stopped because of the limit or of the restart keep their transcripts: resume each of them now by sending it a message with SendMessage. Background commands and monitors were terminated by the restart and will not report back; start again any that are still needed.'
 # How long a sign-in waits for the browser to come back.
 LOGIN_TIMEOUT = 900.0
 # Account names that can sign in: each gets a directory of that name.
 LOGIN_NAME = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9._-]*')
+# Tools that change the session's scheduled tasks, followed through their results between Stop hooks.
+CRON_TOOLS = ('CronCreate', 'CronDelete', 'ScheduleWakeup')
+# How long a one-shot scheduled task past its time still keeps the session awake: the CLI fires it once no turn is under way.
+CRON_GRACE = 120.0
 # Credentials in the daemon's environment take precedence over a sign-in stored in the config directory.
 CREDENTIAL_ENV = ('ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN')
 
@@ -88,18 +102,35 @@ def session_registry() -> Path:
     """The directory where running Claude Code processes register their open session, under `CLAUDE_CONFIG_DIR` like the SDK's session functions."""
     return Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'sessions'
 
-def holder_pid(session_id: str) -> int | None:
-    """Return the pid of a running Claude Code process that has this session open, if any."""
+def process_start(pid: int) -> str | None:
+    """The start time of a process as the CLI records it (`procStart`): field 22 of `/proc/<pid>/stat`. None where there is no `/proc`."""
+    try:
+        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    except OSError:
+        return None
+
+def same_process(pid: int, start: str | None) -> bool:
+    """Whether a process with this pid is running and, where its start time can be read, is the one that started at `start`, not a later one that reuses the pid."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return start is None or process_start(pid) in (None, start)
+
+def holder(session_id: str) -> tuple[int, str | None] | None:
+    """The pid and start time of a running Claude Code process that has this session open, if any. Registrations whose process has exited are left behind when it is killed, and their pid may since belong to another process."""
     for f in session_registry().glob('*.json'):
         try:
             d = json.loads(f.read_text())
-            if d.get('sessionId') != session_id:
-                continue
-            os.kill(d['pid'], 0)
-            return d['pid']
+            if d.get('sessionId') == session_id and same_process(d['pid'], d.get('procStart')):
+                return d['pid'], d.get('procStart')
         except (OSError, ValueError, KeyError):
             continue
     return None
+
+def restorable(crons: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    """The scheduled tasks a new process restores from the transcript: CronCreate tasks that are recurring or not yet due. Wakeups are not restored, one-shot tasks due by now are dropped, and a one-shot task whose time is unknown is left out rather than keep a session awake for a task that may be gone."""
+    return [c for c in crons if not c['wakeup'] and (c['recurring'] or (c['fires_at'] is not None and c['fires_at'] > now))]
 
 def write_private(path: Path, text: str) -> None:
     """Atomically replace a file with one only its owner can read."""
@@ -236,8 +267,11 @@ class Prompt:
 class Conflict(Exception):
     pass
 
+class Removed(Exception):
+    pass
+
 class Session:
-    def __init__(self, daemon: 'Daemon', session_id: str, config: SessionConfig, created: float, last_active: float, seq: int = 0, archived: bool = False) -> None:
+    def __init__(self, daemon: 'Daemon', session_id: str, config: SessionConfig, created: float, last_active: float, seq: int = 0, archived: bool = False, process: tuple[int, str | None] | None = None, crons: list[dict[str, Any]] | None = None) -> None:
         self.daemon = daemon
         self.id = session_id
         self.config = config
@@ -251,12 +285,25 @@ class Session:
         self.stop_event = asyncio.Event()
         self.events: deque[dict[str, Any]] = deque(maxlen=EVENT_BUFFER)
         self.seq = seq
+        self.seq_limit = seq
         self.archived = archived
+        # The pid and start time of the `claude` process last started for this session; kept in the state file until the process stops, so that one left behind by a crashed daemon can be recognized.
+        self.process = process
+        self.start_lock = asyncio.Lock()
         self.tick = asyncio.Event()
         self.prompts: dict[str, Prompt] = {}
         self.outstanding: dict[str, asyncio.Future] = {}
         self.sent: dict[str, dict[str, Any]] = {}
+        # A turn of the main thread is under way: from its `init` system message, which the CLI sends at the start of every turn, including those it starts by itself, to its result.
         self.turn_active = False
+        # That turn has produced output; a message it takes in from then on did not start it.
+        self.turn_answering = False
+        # The CLI's latest `background_tasks_changed` list: the background shells, monitors and agents still running.
+        self.background_tasks: list[dict[str, Any]] = []
+        # The session's scheduled tasks (CronCreate, ScheduleWakeup), which live in the process too: the list of the last Stop hook, updated by the cron tools' results since. `fires_at` is the fire time of a one-shot task, known when a result announced it; `wakeup` marks those made by ScheduleWakeup. Kept in the state file, so that a session started again without a message stays awake for the tasks its new process restores.
+        self.crons = crons or []
+        # Cron tool calls awaiting their results, by tool use id.
+        self.cron_calls: dict[str, ToolUseBlock] = {}
         self.last_result: dict[str, Any] | None = None
         self.cost_usd = 0.0
         self.applied_name: str | None = None
@@ -268,6 +315,9 @@ class Session:
     # Event log
     def emit(self, kind: str, data: Any) -> None:
         self.seq += 1
+        if self.seq > self.seq_limit:
+            self.seq_limit = self.seq + SEQ_RESERVE
+            self.daemon.save()
         self.last_active = time.time()
         self.events.append({'seq': self.seq, 'time': self.last_active, 'kind': kind, 'data': data})
         self.tick.set()
@@ -301,6 +351,12 @@ class Session:
             self.status = status
             self.emit('status', {'status': status})
 
+    def keeps_awake(self) -> bool:
+        """Whether stopping the process would lose work: a background task, whose result would never come back, or a scheduled wakeup, which would never fire. The CLI marks tasks that are not activity (`ambient`) and tasks that run outside the process (`off_host`)."""
+        if any(c['recurring'] or c['fires_at'] is None or c['fires_at'] > time.time() - CRON_GRACE for c in self.crons):
+            return True
+        return any(not t.get('ambient') and not t.get('off_host') for t in self.background_tasks)
+
     def brief(self) -> dict[str, Any]:
         return {'id': self.id, 'name': self.config.name, 'cwd': self.config.cwd, 'status': self.status}
 
@@ -313,6 +369,8 @@ class Session:
             'last_active': self.last_active,
             'config': self.config.model_dump(),
             'pending_prompts': [p.info for p in self.prompts.values()],
+            'background_tasks': self.background_tasks,
+            'crons': self.crons if self.client is not None else restorable(self.crons, time.time()),
             'last_result': self.last_result,
             'cost_usd': self.cost_usd,
             'seq': self.seq,
@@ -354,28 +412,56 @@ class Session:
             enable_file_checkpointing=c.checkpointing,
             cli_path=self.daemon.cli_path,
             can_use_tool=self.can_use_tool,
+            hooks={'Stop': [HookMatcher(hooks=[self.on_stop])]},
             env=account.environment(),
             resume=self.id if exists else None,
             session_id=None if exists else self.id,
         )
 
     async def ensure_started(self, force: bool = False) -> None:
-        if self.status == 'dormant':
-            pid = holder_pid(self.id)
-            if pid is not None and not force:
-                raise Conflict(f'session {self.id} is open in another Claude Code process (pid {pid}); pass force=true to open it anyway')
-            self.unarchive()
-            self.ready = asyncio.get_running_loop().create_future()
-            self.stop_event = asyncio.Event()
-            self.error = None
-            self.set_status('starting')
-            self.task = asyncio.create_task(self.run())
+        # Starts and stops are serialized, so a request arriving while the process exits waits for it and starts a new one, and a stop or archive arriving while a leftover process is ended takes effect after the start.
+        async with self.start_lock:
+            if self.status == 'dormant':
+                other = holder(self.id)
+                if other is not None and other == self.process and other[1] is not None:
+                    await self.kill_leftover(*other)
+                elif other is not None and not force:
+                    raise Conflict(f'session {self.id} is open in another Claude Code process (pid {other[0]}); pass force=true to open it anyway')
+            # Checked after every wait: the request may have looked the session up before it was deleted, and starting it then would leave a process no one stops.
+            if self.daemon.sessions.get(self.id) is not self:
+                raise Removed(f'unknown session {self.id}')
+            if self.status == 'dormant':
+                # One-shot tasks that came due while the session slept are gone.
+                self.crons = restorable(self.crons, time.time())
+                self.unarchive()
+                self.ready = asyncio.get_running_loop().create_future()
+                self.stop_event = asyncio.Event()
+                self.error = None
+                self.set_status('starting')
+                self.task = asyncio.create_task(self.run())
         await asyncio.shield(self.ready)
+
+    async def kill_leftover(self, pid: int, start: str) -> None:
+        """Stop the `claude` process a crashed daemon left running for this session (one with background tasks outlives its input), so that two processes do not write the same transcript. It is recognized by its pid and start time, so a process that reuses the pid is never signalled."""
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # It exited by itself after it was found.
+            return
+        # It unregisters the session before it exits, so wait for the process itself.
+        for _ in range(100):
+            await asyncio.sleep(0.1)
+            if not same_process(pid, start):
+                return
+        os.kill(pid, signal.SIGKILL)
 
     async def run(self) -> None:
         try:
             async with ClaudeSDKClient(self.options()) as client:
                 self.client = client
+                pid = client._transport._process.pid
+                self.process = pid, process_start(pid)
+                self.daemon.save()
                 self.ready.set_result(None)
                 self.set_status()
                 reader = asyncio.create_task(self.read(client))
@@ -394,6 +480,7 @@ class Session:
                 self.ready.set_exception(e)
         finally:
             self.client = None
+            self.process = None
             for p in list(self.prompts.values()):
                 p.resolve(PermissionResultDeny(message='Session stopped', interrupt=True), 'stopped')
             for u, f in self.outstanding.items():
@@ -404,7 +491,11 @@ class Session:
             self.outstanding.clear()
             if not self.switching:
                 self.release_relayed()
-            self.turn_active = False
+            self.turn_active = self.turn_answering = False
+            self.background_tasks = []
+            # Kept for the next process, which restores them before any Stop hook lists them.
+            self.crons = restorable(self.crons, time.time())
+            self.cron_calls.clear()
             self.limit_error = self.limit_resets = None
             # A dormant session keeps nothing but its config in memory; its full history stays readable from the transcript (`/history`). `seq` keeps counting, so event cursors stay valid.
             self.events.clear()
@@ -412,9 +503,10 @@ class Session:
             self.daemon.save()
 
     async def stop(self) -> None:
-        if self.task is not None and not self.task.done():
-            self.stop_event.set()
-            await self.task
+        async with self.start_lock:
+            if self.task is not None and not self.task.done():
+                self.stop_event.set()
+                await self.task
 
     async def archive(self) -> None:
         """Mark the session as no longer in use: stop it, drop what it holds in memory and hide it from the session list. Using it again unarchives it."""
@@ -440,13 +532,26 @@ class Session:
                 target = self.on_limit(message.is_error) if self.limit_error is not None else None
                 self.on_result(message, relay=self.switching or target is not None)
             elif isinstance(message, (AssistantMessage, StreamEvent)):
-                self.turn_active = True
+                # Subagents run alongside the turns of the main thread and are tracked as background tasks; a limit they run into still counts.
+                if message.parent_tool_use_id is None:
+                    self.turn_active = self.turn_answering = True
                 if isinstance(message, AssistantMessage) and message.error in LIMIT_ERRORS:
                     self.limit_error = message.error
+                if isinstance(message, AssistantMessage):
+                    self.cron_calls |= {b.id: b for b in message.content if isinstance(b, ToolUseBlock) and b.name in CRON_TOOLS}
             elif isinstance(message, RateLimitEvent) and message.rate_limit_info.status == 'rejected':
                 self.limit_resets = message.rate_limit_info.resets_at
             elif isinstance(message, UserMessage) and message.uuid in self.sent:
                 self.on_taken(message.uuid)
+            elif isinstance(message, UserMessage) and isinstance(message.content, list):
+                for b in message.content:
+                    if isinstance(b, ToolResultBlock) and b.tool_use_id in self.cron_calls:
+                        self.on_cron_result(self.cron_calls.pop(b.tool_use_id), message.tool_use_result if not b.is_error else None)
+            elif isinstance(message, SystemMessage) and message.subtype == 'init':
+                self.turn_active = True
+            elif isinstance(message, SystemMessage) and message.subtype == 'background_tasks_changed':
+                # The full set after each change; the CLI sends nothing at startup, when the set is empty.
+                self.background_tasks = message.data['tasks']
             self.set_status()
             if isinstance(message, ResultMessage):
                 self.daemon.notify('result', self, self.last_result)
@@ -481,10 +586,6 @@ class Session:
         try:
             previous = self.config.account
             self.config.account = target.name
-            # Taken in by the turn that failed, which has ended: done, and answered by the continuing turn.
-            for u in [u for u in self.outstanding if self.sent.get(u, {}).get('state') == 'taken']:
-                self.relayed.append(self.outstanding.pop(u))
-                self.sent[u]['state'] = 'done'
             await self.stop()
             # Announced after stopping, which clears the event buffer.
             self.announce_switch(previous, target.name, reason)
@@ -517,11 +618,11 @@ class Session:
         """`--replay-user-messages` echoes a sent message when a turn takes it in. A message that starts a turn is a file checkpoint; one taken in mid-turn is not."""
         record = self.sent[u]
         record['state'] = 'taken'
-        record['checkpoint'] = not self.turn_active
+        record['checkpoint'] = not self.turn_answering
         self.emit('taken', {'uuid': u, 'checkpoint': record['checkpoint']})
 
     def on_result(self, message: ResultMessage, relay: bool = False) -> None:
-        self.turn_active = False
+        self.turn_active = self.turn_answering = False
         self.cost_usd += message.total_cost_usd or 0.0
         self.last_result = {
             'subtype': message.subtype,
@@ -535,17 +636,17 @@ class Session:
         if self.config.name is not None and self.applied_name != self.config.name:
             rename_session(self.id, self.config.name, directory=self.config.cwd)
             self.applied_name = self.config.name
-        aborted = message.terminal_reason in ('aborted_streaming', 'aborted_tools')
-        taken = list(self.outstanding) if aborted or message.user_message_uuids is None else message.user_message_uuids
-        for u in taken:
-            f = self.outstanding.pop(u, None)
-            if f is not None and not f.done():
+        # A turn ends the messages it took in. Queued ones go on to a later turn even when this one was interrupted, and a turn the CLI started by itself (a finished background task, a scheduled wakeup) lists none.
+        listed = set(message.user_message_uuids or ())
+        for u in [u for u in self.outstanding if u in listed or self.sent.get(u, {}).get('state') == 'taken']:
+            f = self.outstanding.pop(u)
+            if not f.done():
                 if relay:
                     self.relayed.append(f)
                 else:
                     f.set_result(self.last_result)
             if u in self.sent:
-                self.sent[u]['state'] = 'done' if self.sent[u]['state'] == 'taken' else 'dropped'
+                self.sent[u]['state'] = 'done'
 
     # User actions
     async def send(self, text: str) -> tuple[str, asyncio.Future]:
@@ -593,8 +694,9 @@ class Session:
     async def interrupt(self) -> None:
         for p in list(self.prompts.values()):
             p.resolve(PermissionResultDeny(message='Interrupted by user', interrupt=True), 'interrupted')
-        if self.client is not None:
-            await self.client.interrupt()
+        # Without `spare_background_tasks` the CLI also stops every background agent; those are stopped one by one through `/tasks/{task_id}/stop`. A process being stopped no longer takes requests, and stopping ends the turn anyway.
+        if self.client is not None and not self.stop_event.is_set():
+            await control(self.client, {'subtype': 'interrupt', 'spare_background_tasks': True})
 
     async def can_use_tool(self, tool_name: str, tool_input: dict[str, Any], ctx: ToolPermissionContext) -> PermissionResultAllow | PermissionResultDeny:
         prompt_id = secrets.token_hex(4)
@@ -633,6 +735,36 @@ class Session:
             self.emit('prompt_resolved', {'id': prompt_id, 'reason': prompt.reason})
             self.set_status()
             self.daemon.notify('prompt_resolved', self, {'id': prompt_id, 'reason': prompt.reason})
+
+    async def on_stop(self, data: HookInput, tool_use_id: str | None, context: HookContext) -> HookJSONOutput:
+        """The Stop hook, run when a turn of the main thread ends normally, is where the CLI lists the session's scheduled tasks; older CLIs leave `session_crons` out. What only the tools' results tell (the fire time of a one-shot task, and which task is a ScheduleWakeup) is kept: by id, or for a ScheduleWakeup, whose result has no id, by prompt."""
+        if 'session_crons' in data:
+            known = {c['id'] or c['prompt']: c for c in self.crons}
+            crons = []
+            for c in data['session_crons']:
+                previous = known.get(c['id']) or known.get(c['prompt']) or {}
+                crons.append(c | {'fires_at': previous.get('fires_at'), 'wakeup': previous.get('wakeup', False)})
+            if crons != self.crons:
+                self.crons = crons
+                self.daemon.save()
+        return {}
+
+    def on_cron_result(self, call: ToolUseBlock, result: Any) -> None:
+        """Follow a change to the scheduled tasks made in a turn that may end without a Stop hook (interrupted or failed). Durable tasks are kept in the project, not in the process, and the Stop hook does not list them either."""
+        if not isinstance(result, dict):
+            return
+        if call.name == 'CronCreate' and not result['durable']:
+            # Only a one-shot task's fire time matters, and a recurring one's would go stale.
+            fires_at = None if result['recurring'] else result['nextFireAt'] / 1000
+            self.crons.append({'id': result['id'], 'schedule': call.input['cron'], 'recurring': result['recurring'], 'prompt': call.input['prompt'], 'fires_at': fires_at, 'wakeup': False})
+        elif call.name == 'ScheduleWakeup':
+            # A wakeup supersedes the one pending, and `stop` cancels it.
+            self.crons = [c for c in self.crons if not c['wakeup']]
+            if not result.get('stopped'):
+                self.crons.append({'id': None, 'schedule': None, 'recurring': False, 'prompt': call.input['prompt'], 'fires_at': result['scheduledFor'] / 1000, 'wakeup': True})
+        elif call.name == 'CronDelete':
+            self.crons = [c for c in self.crons if c['id'] != result['id']]
+        self.daemon.save()
 
     def answer(self, prompt_id: str, a: PromptAnswer) -> None:
         prompt = self.prompts.get(prompt_id)
@@ -745,11 +877,11 @@ class Daemon:
         if not self.state_path.exists():
             return
         for item in json.loads(self.state_path.read_text()):
-            self.sessions[item['id']] = Session(self, item['id'], SessionConfig(**item['config']), item['created'], item['last_active'], item['seq'], item['archived'])
+            self.sessions[item['id']] = Session(self, item['id'], SessionConfig(**item['config']), item['created'], item['last_active'], item['seq'], item['archived'], tuple(item['process']) if item.get('process') else None, restorable(item.get('crons', []), time.time()))
 
     def save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        items = [{'id': s.id, 'config': s.config.model_dump(), 'created': s.created, 'last_active': s.last_active, 'seq': s.seq, 'archived': s.archived} for s in self.sessions.values()]
+        items = [{'id': s.id, 'config': s.config.model_dump(), 'created': s.created, 'last_active': s.last_active, 'seq': s.seq_limit, 'archived': s.archived, 'process': s.process, 'crons': s.crons} for s in self.sessions.values()]
         write_private(self.state_path, json.dumps(items, indent=1, ensure_ascii=False))
 
     def save_accounts(self) -> None:
@@ -815,12 +947,15 @@ class Daemon:
             await asyncio.sleep(min(30.0, self.idle_timeout))
             now = time.time()
             for s in list(self.sessions.values()):
-                if s.status == 'idle' and now - s.last_active > self.idle_timeout:
+                if s.status == 'idle' and not s.keeps_awake() and now - s.last_active > self.idle_timeout:
                     await s.stop()
 
     async def shutdown(self) -> None:
         await asyncio.gather(*(login.cancel() for login in self.logins.values()))
         await asyncio.gather(*(s.stop() for s in self.sessions.values()))
+        # After a clean shutdown numbering resumes where it stopped.
+        for s in self.sessions.values():
+            s.seq_limit = s.seq
         self.save()
 
 def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> FastAPI:
@@ -857,6 +992,8 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
             await s.ensure_started(force)
         except Conflict as e:
             raise HTTPException(409, str(e))
+        except Removed as e:
+            raise HTTPException(404, str(e))
         except Exception as e:
             raise HTTPException(502, f'failed to start claude: {e!r}')
 
@@ -944,8 +1081,9 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
     @app.delete('/sessions/{session_id}')
     async def remove_session(session_id: str, purge: bool = False) -> dict[str, Any]:
         s = daemon.get(session_id)
-        await s.stop()
+        # Removed first, so that a request arriving meanwhile does not start the session again.
         del daemon.sessions[session_id]
+        await s.stop()
         if purge and get_session_info(s.id, directory=s.config.cwd) is not None:
             delete_session(s.id, directory=s.config.cwd)
         daemon.save()
@@ -1176,7 +1314,7 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
             d = to_jsonable(info)
             d['hosted'] = info.session_id in daemon.sessions
             d['archived'] = d['hosted'] and daemon.sessions[info.session_id].archived
-            d['holder_pid'] = holder_pid(info.session_id)
+            d['holder_pid'] = (holder(info.session_id) or (None,))[0]
             out.append(d)
         return out
 
@@ -1200,7 +1338,8 @@ def main() -> None:
     warnings.filterwarnings('ignore', message='can_use_tool will not be invoked')
     scrub_environment(args.keep_env)
     daemon = Daemon(args.state, args.idle_timeout, args.cli_path, args.prompt_timeout or None, args.webhook, args.webhook_token)
-    uvicorn.run(create_app(daemon, args.token, LOCAL_HOSTS | set(args.allow_host)), host=args.host, port=args.port, log_level='warning')
+    # Event streams never end on their own, so without a timeout a SIGTERM waits on them forever and the sessions are never stopped.
+    uvicorn.run(create_app(daemon, args.token, LOCAL_HOSTS | set(args.allow_host)), host=args.host, port=args.port, log_level='warning', timeout_graceful_shutdown=5)
 
 if __name__ == '__main__':
     main()
