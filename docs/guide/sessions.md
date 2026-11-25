@@ -7,7 +7,7 @@
 | 状态 | 含义 |
 | --- | --- |
 | `starting` | `claude` 进程正在启动，通常约 0.5 秒 |
-| `idle` | 进程在运行，主会话没有进行中的回合；后台任务、子智能体与 teammate 可能仍在运行 |
+| `idle` | 进程在运行，主会话没有进行中的回合；后台任务与子智能体可能仍在运行 |
 | `running` | 回合进行中（包括 CLI 自行开启的回合），或者有已发出但尚未被回合吸收的消息 |
 | `waiting` | 有待回答的权限确认或提问 |
 | `dormant` | 没有进程；会话记录保留在磁盘上 |
@@ -66,17 +66,16 @@
 
 会话缺省以 `allow_bypass` 启动，运行中可以用 `PATCH /sessions/{id}` 把权限模式切换为 `bypassPermissions`。未指定 `permission_mode` 时，会话使用设置中的 `defaultMode`；若该值为 `bypassPermissions`，普通工具调用不会产生权限确认。
 
-## 智能体团队
+## 子智能体
 
-会话可以使用 Claude Code 的智能体团队（agent teams）。在设置的 `env` 中开启 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` 后，主会话用 Agent 工具派生的 teammate 由同一个 `claude` 进程运行。守护进程没有终端，因此应把 `teammateMode` 设为 `in-process`，以下行为均在该模式下验证。若改用环境变量开启，需要用 `--keep-env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` 保留它，否则守护进程启动时会将其清除（见[部署与账号](deployment.md#登录凭据)）。
+主会话用 Agent 工具派生的子智能体由同一个 `claude` 进程运行。守护进程托管的会话不能使用智能体团队（agent teams）：即使在设置中开启了 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`，带 `name` 的 Agent 调用派生的也是普通的后台子智能体（`task_type` 为 `local_agent`），而不是 teammate，团队特有的协作功能不可用（见[未解决的问题](../issues.md#sdk-会话不能使用智能体团队)）。带 `name` 的子智能体可以用 SendMessage 联系，能满足让多个有名字的子智能体并行工作、随后继续交代任务的用法。
 
-- teammate 的消息与工具调用照常出现在事件流中，`parent_tool_use_id` 为派生它的 Agent 调用；teammate 的启动、进度与结束另有 `task_started`、`task_progress`、`task_notification` 等系统消息。
-- teammate 需要确认的工具调用与主会话的一样挂起为提示，提示的 `agent_id` 标明发起调用的 teammate。
-- 主会话派生 teammate 后通常先结束当前回合，`wait` 随该回合返回，此时 teammate 可能仍在运行；teammate 的消息不改变会话的状态。teammate 用 SendMessage 回复后，CLI 不经用户消息自行开启新的回合。这个回合同样产生 `result` 事件与 webhook 通知并更新 `last_result`，但不对应任何已发消息，`wait` 等不到它，其结果需要从事件流或 webhook 获取。
-- 运行中的 teammate、子智能体与后台任务可以用 `POST /sessions/{id}/tasks/{task_id}/stop` 单独停止，主会话的回合不受影响。
-- teammate 与主会话使用同一个账号，额度用完时一同受影响。teammate 遇到限制后提前结束，主会话随即开启的回合在同一个账号下同样失败，于是触发[账号切换](deployment.md#多个账号)。切换会重启进程，仍在运行的 teammate 随之中断，其中正在执行的命令被终止。继续的消息要求主会话用 SendMessage 恢复因额度或重启而停下的 teammate；CLI 从 teammate 自己的会话记录恢复它，它从中断处继续，必要时重新执行被终止的命令。
-
-空闲的 teammate 仍是运行中的后台任务，`background_tasks` 中没有区分空闲与否的字段，因此团队存在期间会话不会休眠。不再需要的 teammate 应由主会话关闭，或用 `/tasks/{task_id}/stop` 停止；会话休眠或被 `/stop` 时，teammate 随进程结束。
+- 子智能体的消息与工具调用照常出现在事件流中，`parent_tool_use_id` 为派生它的 Agent 调用；子智能体的启动、进度与结束另有 `task_started`、`task_progress`、`task_updated`、`task_notification` 等系统消息。子智能体的消息不改变会话的状态。
+- 子智能体需要确认的工具调用与主会话的一样挂起为提示，提示的 `agent_id` 标明发起调用的子智能体，会话的状态随之变为 `waiting`。
+- 主会话派生后台子智能体后通常先结束当前回合，`wait` 随该回合返回，此时子智能体仍在运行，会话不会休眠（见[会话的状态](#会话的状态)）。子智能体结束后，CLI 不经用户消息自行开启新的回合报告结果。这个回合同样产生 `result` 事件与 webhook 通知并更新 `last_result`，但不对应任何已发消息，`wait` 等不到它，其结果需要从事件流或 webhook 获取。
+- 主会话可以用 SendMessage 给带 `name` 的子智能体发消息。已经结束的子智能体由 CLI 从它自己的会话记录恢复，保留此前的上下文，作为新的后台任务继续运行。
+- 运行中的子智能体与后台任务可以用 `POST /sessions/{id}/tasks/{task_id}/stop` 单独停止，主会话的回合不受影响。
+- 子智能体与主会话使用同一个账号，额度用完时一同受影响。子智能体遇到限制后提前结束，主会话随即开启的回合在同一个账号下同样失败，于是触发[账号切换](deployment.md#多个账号)。切换会重启进程，仍在运行的子智能体随之中断，其中正在执行的命令被终止。继续的消息要求主会话用 SendMessage 恢复因额度或重启而停下的子智能体；CLI 从子智能体自己的会话记录恢复它，它从中断处继续，必要时重新执行被终止的命令。
 
 ## 文件回滚
 

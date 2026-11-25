@@ -32,10 +32,11 @@ curl -s $B/prompts
 
 在线文档：<https://ayaka14732.github.io/claude-sessiond/>
 
-- [会话与消息](docs/guide/sessions.md)：会话的状态、休眠与归档、消息的状态、权限确认与提问、文件回滚。
+- [会话与消息](docs/guide/sessions.md)：会话的状态、休眠与归档、消息的状态、权限确认与提问、子智能体、文件回滚。
 - [部署与账号](docs/guide/deployment.md)：以 systemd 用户服务常驻运行、登录凭据、多个账号与额度用完时的自动切换、访问控制。
 - [参考](docs/reference.md)：命令行参数、HTTP API、事件格式与 webhook。
 - [实现说明](docs/design.md)：与 CLI 的交互方式、直接发送的控制请求、登录、账号切换、内存与持久化。
+- [未解决的问题](docs/issues.md)：有待 Claude Code 或 SDK 上游改动才能解决的问题，以及升级 SDK 后的确认方法。
 
 文档站的构建方法：
 

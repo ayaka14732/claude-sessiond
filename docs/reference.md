@@ -38,7 +38,7 @@
 | `GET /sessions/{id}/history` | 会话记录中的完整历史，休眠的会话同样可读；`?limit=&offset=` 分页，`offset` 为负数时从末尾算起，例如 `?offset=-200` 取最后 200 条；`?before=<uuid>&limit=` 取这条消息之前的 `limit` 条，会话记录仍在增长时也不会错位 |
 | `GET /sessions/{id}/context` | 上下文用量，仅限活跃的会话 |
 | `GET /sessions/{id}/info` | CLI 的初始化信息，包括可用的斜杠命令（`commands`）、智能体（`agents`）、模型（`models`）、输出风格与 CLI 版本，仅限活跃的会话 |
-| `POST /sessions/{id}/tasks/{task_id}/stop` | 停止一个子智能体、teammate 或后台任务；`task_id` 取自 `task_started` 系统消息，停止后 CLI 输出状态为终态的 `task_updated`，仅限活跃的会话 |
+| `POST /sessions/{id}/tasks/{task_id}/stop` | 停止一个子智能体或后台任务；`task_id` 取自 `task_started` 系统消息，停止后 CLI 输出状态为终态的 `task_updated`，仅限活跃的会话 |
 | `GET /prompts` | 所有会话中待回答的提示 |
 | `POST /sessions/{id}/prompts/{prompt_id}` | 回答提示，格式见[权限确认与提问](guide/sessions.md#权限确认与提问) |
 | `GET /transcripts` | 本机的会话记录（`?cwd=` 筛选），标明是否已托管、是否已归档、是否正被某个进程打开 |

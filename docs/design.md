@@ -29,7 +29,7 @@ CLI 在某个回合实际吸收一条用户消息时，以同一个 `uuid` 回�
 - 收到回送时记为 `taken`。若此时当前回合尚未输出（自上一个 `ResultMessage` 之后尚未收到主会话的 `AssistantMessage` 或 `StreamEvent`），这条消息开启了新回合，`checkpoint` 记为真。
 - 收到 `ResultMessage` 时，状态为 `taken` 的消息与 `user_message_uuids` 中的消息记为 `done`，并唤醒以 `wait` 等待它们的请求。仍为 `queued` 的消息保持不变：普通的中断不丢弃排队的消息（CLI 在中断请求的响应中以 `still_queued` 列出它们），它们由之后的回合吸收；CLI 自行开启的回合（后台任务结束、定时任务触发）的 `user_message_uuids` 为 null，但可能在中途吸收消息。进程停止时，尚未 `done` 的消息记为 `dropped`。
 
-会话的状态只反映主会话的回合。CLI 在每个回合开始时输出 `init` 系统消息，包括它自行开启的回合；守护进程以它为回合的开始，以 `ResultMessage` 为结束。`init` 先于开启回合的那条消息的回送，因此 `checkpoint` 不以 `init` 为准，而以主会话的首个输出为准。子智能体与 teammate 的 `AssistantMessage` 与 `StreamEvent` 带有 `parent_tool_use_id`，不计入回合：它们可以在主会话的回合之外运行，而且被中断时不一定产生 `ResultMessage`；它们是否仍在运行由后台任务的列表反映（见下一节）。
+会话的状态只反映主会话的回合。CLI 在每个回合开始时输出 `init` 系统消息，包括它自行开启的回合；守护进程以它为回合的开始，以 `ResultMessage` 为结束。`init` 先于开启回合的那条消息的回送，因此 `checkpoint` 不以 `init` 为准，而以主会话的首个输出为准。子智能体的 `AssistantMessage` 与 `StreamEvent` 带有 `parent_tool_use_id`，不计入回合：它们可以在主会话的回合之外运行，而且被中断时不一定产生 `ResultMessage`；它们是否仍在运行由后台任务的列表反映（见下一节）。
 
 SDK 读取 CLI 的 `session_state_changed`（经 `CLAUDE_CODE_SDK_READS_SESSION_STATE` 请求，不交给调用方，最新值存于私有的 `_query._session_state`）。守护进程不采用它：后台子智能体运行期间它一直是 `running`，表示之后是否还会有回合，而不是主会话的回合是否在进行。
 
@@ -69,12 +69,13 @@ CLI 只在 dry run 的响应中给出 `filesChanged`、`insertions` 与 `deletio
 - `background_tasks_changed` 不被 SDK 解析为专门的类型，守护进程从通用 `SystemMessage` 的 `data['tasks']` 读取列表；每个回合开始时的 `init` 系统消息。
 - Stop hook 输入中的 `session_crons`，以及 CronCreate、CronDelete、ScheduleWakeup 结果的结构。
 - 会话注册文件中的 `procStart` 与 `/proc/<pid>/stat` 第 22 个字段相同。
+- [未解决的问题](issues.md)中各条的“确认方法”。
 
 ## 登录
 
 登录由一个不运行会话的专用 `claude` 进程完成，两个凭据变量设为空字符串，使 CLI 使用并写入自己的凭据存储。`claude_authenticate` 返回的 `automaticUrl` 重定向到该进程在本机监听的端口，`claude_oauth_wait_for_completion` 在 CLI 收到重定向、换得并保存凭据之后响应。`claude_authenticate` 同时返回的 `manualUrl` 以一个显示 code 的页面结束，需要把 code 经 `claude_oauth_callback` 交回 CLI；守护进程不采用这种方式。监听端口收到不是由授权页面重定向而来的请求时，这次登录以 `No authorization code received` 失败。
 
-CLI 的凭据存储目录（Linux 上的 `.credentials.json`；macOS 钥匙串条目的名称也由它派生）在设置了 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 时取该变量，否则取配置目录。守护进程据此为 `default` 以外的每个账号单独设置凭据存储目录，配置目录保持共用：若为每个账号单独设置 `CLAUDE_CONFIG_DIR`，会话记录与用户设置也会随之分开，切换账号后会话无法恢复。CLI 把这个变量传给自己启动的子进程（例如 teammate）。
+CLI 的凭据存储目录（Linux 上的 `.credentials.json`；macOS 钥匙串条目的名称也由它派生）在设置了 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 时取该变量，否则取配置目录。守护进程据此为 `default` 以外的每个账号单独设置凭据存储目录，配置目录保持共用：若为每个账号单独设置 `CLAUDE_CONFIG_DIR`，会话记录与用户设置也会随之分开，切换账号后会话无法恢复。CLI 把这个变量传给自己启动的子进程。
 
 登录还把账号的身份（`oauthAccount`）写入配置目录的 `.claude.json`。为了不让其他账号的登录覆盖 `default` 的身份，这些登录的进程使用临时的 `CLAUDE_CONFIG_DIR`，登录结束后删除。`oauthAccount` 与会话实际使用的凭据属于不同账号时，会话照常以凭据所属的账号运行，CLI 也不改写 `oauthAccount`；`claude auth status` 显示的身份取自 `oauthAccount`，与凭据无关，因此要确认某份凭据属于哪个账号，应以它的 access token 查询 `/api/oauth/profile`。
 
