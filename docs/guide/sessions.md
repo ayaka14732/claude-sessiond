@@ -56,10 +56,10 @@
 {"allow": true}                                     // 批准
 {"allow": true, "remember": true}                   // 批准，并应用 CLI 给出的“不再询问”规则
 {"allow": true, "updated_input": {...}}             // 修改参数后批准
-{"allow": false, "message": "不要删除文件"}            // 拒绝，message 交给 Claude
+{"allow": false, "message": "不要删除文件"}         // 拒绝，message 交给 Claude
 {"allow": false, "interrupt": true}                 // 拒绝并结束回合
-{"allow": true, "answers": {"<问题原文>": "Blue"}}    // 回答 AskUserQuestion，多选时给出列表
-{"allow": true, "response": "换一种做法"}              // 不选择任何选项，直接回复一段文字
+{"allow": true, "answers": {"<问题原文>": "Blue"}}  // 回答 AskUserQuestion，多选时给出列表
+{"allow": true, "response": "换一种做法"}           // 不选择任何选项，直接回复一段文字
 ```
 
 提示最多等待 `--prompt-timeout` 秒（缺省 1 小时），截止时间见提示的 `expires` 字段。超时的提示按拒绝处理，Claude 会被告知用户没有回答，并在结束回合时说明需要什么。中断或停止会话时，未回答的提示同样按拒绝处理。
