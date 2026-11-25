@@ -98,9 +98,28 @@ def to_jsonable(o: Any) -> Any:
         return o
     return repr(o)
 
+def config_dir() -> Path:
+    """The Claude Code configuration directory, `CLAUDE_CONFIG_DIR` or `~/.claude`, as the SDK's session functions resolve it."""
+    return Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+
 def session_registry() -> Path:
-    """The directory where running Claude Code processes register their open session, under `CLAUDE_CONFIG_DIR` like the SDK's session functions."""
-    return Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'sessions'
+    """The directory where running Claude Code processes register their open session."""
+    return config_dir() / 'sessions'
+
+def purge_session_files(session_id: str, cwd: str) -> None:
+    """Delete a session's transcript and what the CLI keeps for it besides: its `session-env/` and `file-history/` directories, and the project directory when nothing but an empty `memory/` is left in it."""
+    projects = {p.parent for p in (config_dir() / 'projects').glob(f'*/{session_id}.jsonl')}
+    if get_session_info(session_id, directory=cwd) is not None:
+        delete_session(session_id, directory=cwd)
+    for name in ('session-env', 'file-history'):
+        shutil.rmtree(config_dir() / name / session_id, ignore_errors=True)
+    # `memory/` belongs to the project and may hold other sessions' memories; only empty directories are removed.
+    for project in projects:
+        for d in (project / 'memory', project):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
 
 def process_start(pid: int) -> str | None:
     """The start time of a process as the CLI records it (`procStart`): field 22 of `/proc/<pid>/stat`. None where there is no `/proc`."""
@@ -1084,8 +1103,8 @@ def create_app(daemon: Daemon, token: str | None, allowed_hosts: set[str]) -> Fa
         # Removed first, so that a request arriving meanwhile does not start the session again.
         del daemon.sessions[session_id]
         await s.stop()
-        if purge and get_session_info(s.id, directory=s.config.cwd) is not None:
-            delete_session(s.id, directory=s.config.cwd)
+        if purge:
+            purge_session_files(s.id, s.config.cwd)
         daemon.save()
         return {'id': session_id, 'purged': purge}
 

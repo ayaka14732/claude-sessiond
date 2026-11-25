@@ -30,7 +30,7 @@
 不再使用的会话可以归档或删除，两者都会中止进行中的回合：
 
 - **归档**（`POST /sessions/{id}/archive`）：停止进程，并从 `GET /sessions` 的缺省结果中隐藏（`?include_archived=true` 时列出）。再次发送消息、调用 `/start` 或 `/rewind` 时自动取消归档；`/unarchive` 只取消归档，不启动进程。
-- **删除**（`DELETE /sessions/{id}`）：不再托管该会话，会话记录保留，以后可以用 `POST /sessions` 的 `resume` 字段重新托管；加上 `?purge=true` 时同时删除会话记录。
+- **删除**（`DELETE /sessions/{id}`）：不再托管该会话，会话记录保留，以后可以用 `POST /sessions` 的 `resume` 字段重新托管；加上 `?purge=true` 时同时删除会话记录（含子智能体），以及配置目录中该会话的 `session-env/` 与 `file-history/`（文件检查点）；项目目录中的 `memory/` 属于整个项目，只在它为空时删除，项目目录也只在删空之后删除。
 
 `POST /sessions` 的 `resume` 字段也可以托管在 CLI 或 IDE 中创建的会话，`GET /transcripts` 列出本机所有会话记录；同时指定 `fork: true` 时先复制一份再托管。
 

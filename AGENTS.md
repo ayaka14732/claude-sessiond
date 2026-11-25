@@ -35,7 +35,7 @@ python -m sphinx -n -W --keep-going -b html docs docs/_build
 ## 验证时容易忽略的事实
 
 - 验证不能碰正在使用的守护进程与登录：账号与登录凭据（`accounts.json`、`logins/`）在 `--state` 旁边；`default` 的登录写入配置目录，会替换本机真实的登录。
-- 不设 `CLAUDE_CONFIG_DIR` 时，测试会话的记录写入真实的 `~/.claude/projects`，CLI 还在 `$TMPDIR/claude-<uid>/` 下留下后台任务输出；`purge` 只删除会话记录（含子智能体）。
+- 不设 `CLAUDE_CONFIG_DIR` 时，测试会话的记录写入真实的 `~/.claude/projects`，CLI 还在 `$TMPDIR/claude-<uid>/` 下留下后台任务输出；`purge` 删除会话记录（含子智能体）与该会话的 `session-env/`、`file-history/`，但不删除 `$TMPDIR` 下的输出。
 - 用户设置中的 `defaultMode` 可能是 `bypassPermissions`，此时不会出现权限确认。
 - 会话停止、休眠或切换账号时事件缓冲被清空；`/history` 不含子智能体的记录。
 - `POST /sessions` 响应中的 `config` 是创建时的快照，`wait` 期间切换了账号时 `config.account` 仍是原来的账号。
