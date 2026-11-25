@@ -326,6 +326,9 @@ class Session:
         self.last_result: dict[str, Any] | None = None
         self.cost_usd = 0.0
         self.applied_name: str | None = None
+        # The transcript's title, for lists: the custom title (set by renaming) or the one the CLI generates, else the first prompt. Read again when a turn takes in or ends a message.
+        self.title: str | None = None
+        self.refresh_title()
         self.limit_error: str | None = None
         self.limit_resets: float | None = None
         self.relayed: list[asyncio.Future] = []
@@ -376,6 +379,10 @@ class Session:
             return True
         return any(not t.get('ambient') and not t.get('off_host') for t in self.background_tasks)
 
+    def refresh_title(self) -> None:
+        info = get_session_info(self.id, directory=self.config.cwd)
+        self.title = info and (info.custom_title or info.first_prompt)
+
     def brief(self) -> dict[str, Any]:
         return {'id': self.id, 'name': self.config.name, 'cwd': self.config.cwd, 'status': self.status}
 
@@ -387,6 +394,7 @@ class Session:
             'created': self.created,
             'last_active': self.last_active,
             'config': self.config.model_dump(),
+            'title': self.title,
             'pending_prompts': [p.info for p in self.prompts.values()],
             'background_tasks': self.background_tasks,
             'crons': self.crons if self.client is not None else restorable(self.crons, time.time()),
@@ -639,6 +647,8 @@ class Session:
         record['state'] = 'taken'
         record['checkpoint'] = not self.turn_answering
         self.emit('taken', {'uuid': u, 'checkpoint': record['checkpoint']})
+        if self.title is None:
+            self.refresh_title()
 
     def on_result(self, message: ResultMessage, relay: bool = False) -> None:
         self.turn_active = self.turn_answering = False
@@ -655,6 +665,7 @@ class Session:
         if self.config.name is not None and self.applied_name != self.config.name:
             rename_session(self.id, self.config.name, directory=self.config.cwd)
             self.applied_name = self.config.name
+        self.refresh_title()
         # A turn ends the messages it took in. Queued ones go on to a later turn even when this one was interrupted, and a turn the CLI started by itself (a finished background task, a scheduled wakeup) lists none.
         listed = set(message.user_message_uuids or ())
         for u in [u for u in self.outstanding if u in listed or self.sent.get(u, {}).get('state') == 'taken']:

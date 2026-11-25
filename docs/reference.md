@@ -23,7 +23,7 @@
 | `GET /health` | 托管的会话数与活跃进程数 |
 | `GET /sessions` | 托管的会话；`?include_archived=true` 时包括已归档的会话 |
 | `POST /sessions` | 新建会话，或用 `resume` 托管已有的会话记录（`fork: true` 时先复制）；可以用 `prompt` 同时发送第一条消息 |
-| `GET /sessions/{id}` | 状态、选项、待回答的提示、运行中的后台任务（`background_tasks`，CLI 最近一次 `background_tasks_changed` 系统消息中的 `tasks`）、会话内的定时任务（`crons`，每项含 `id`、`schedule`、`recurring`、`prompt`、一次性定时任务的触发时间 `fires_at` 与标明 ScheduleWakeup 的 `wakeup`，未知的字段为 null；休眠时 `background_tasks` 为空，`crons` 只保留下次启动时 CLI 会恢复的定时任务）、上一回合的结果，以及本次守护进程运行期间的累计费用 |
+| `GET /sessions/{id}` | 状态、选项、标题（`title`：会话记录的自定义标题或 CLI 生成的标题，没有时为第一条消息，会话记录尚不存在时为 null）、待回答的提示、运行中的后台任务（`background_tasks`，CLI 最近一次 `background_tasks_changed` 系统消息中的 `tasks`）、会话内的定时任务（`crons`，每项含 `id`、`schedule`、`recurring`、`prompt`、一次性定时任务的触发时间 `fires_at` 与标明 ScheduleWakeup 的 `wakeup`，未知的字段为 null；休眠时 `background_tasks` 为空，`crons` 只保留下次启动时 CLI 会恢复的定时任务）、上一回合的结果，以及本次守护进程运行期间的累计费用 |
 | `PATCH /sessions/{id}` | 修改 `name`（同时写入会话记录的标题）、`model` 与 `permission_mode`（活跃时立即生效）、`effort` 与 `account`（下次启动时生效） |
 | `DELETE /sessions/{id}` | 停止并不再托管；`?purge=true` 时同时删除会话记录及 CLI 为该会话保留的文件（见[归档与删除](guide/sessions.md#归档与删除)） |
 | `POST /sessions/{id}/messages` | 发送消息：`text`、`wait`、`timeout`、`interrupt` |
